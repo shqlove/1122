@@ -26,6 +26,8 @@ import {
   SlidersHorizontal,
   Volume2,
   Scissors,
+  Trash2,
+  RotateCcw,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -566,6 +568,7 @@ function Overview() {
   const { lib, overview: view, setOverview, goSource, goPost, act, busy, agent, setPanel, refresh, startVideo, startVideos } = useApp();
   const [batchAction,setBatchAction] = useState<string | null>(null), [batchResult,setBatchResult] = useState("");
   const [operating,setOperating] = useState(false);
+  const [groupActionTarget,setGroupActionTarget] = useState<any>(null);
   const [detail, setDetail] = useState<any>(null), [imageDetail, setImageDetail] = useState<any>(null);
   const change = (values: any) => setOverview((old: any) => ({...old, ...values, limit: values.limit || 24}));
   const allGroups = lib.groups || [];
@@ -581,6 +584,8 @@ function Overview() {
     (view.filter === "single" && v.kind === "generation") || (view.filter === "assembly" && v.kind === "assembly") ||
     (view.filter === "ir_on" && v.context_ir === true) || (view.filter === "ir_off" && v.context_ir === false)));
   const pickedGroups = groups.filter((g: any) => view.picked.includes(g.id));
+  const actionGroups = groupActionTarget ? [groupActionTarget] : pickedGroups;
+  const closeGroupAction = () => {if(!operating){setBatchAction(null);setGroupActionTarget(null);}};
   const queueProjects = [...new Set(pickedGroups.map((g: any) => g.project_id))] as string[];
   const prepareScope = async (pid: string, clean = false) => {
     const selected = pickedGroups.filter((g: any) => g.project_id === pid);
@@ -649,6 +654,7 @@ function Overview() {
           <div className="row wrap" style={{marginTop:12}}>
             <Button disabled={g.trashed} onClick={() => startVideo(g.project_id, [g.group_id])}><Clapperboard size={15} />仅生成本组</Button>
             <Button variant="ghost" onClick={() => goSource(g)}>查看来源图片组 <ArrowRight size={14} /></Button>
+            <Button variant="ghost" size="sm" className={g.trashed?"group-card-remove":"group-card-remove text-red-600 hover:text-red-700 hover:bg-red-50"} disabled={operating} onClick={()=>{setGroupActionTarget(g);setBatchAction(g.trashed?'restore':'trash');}}>{g.trashed?<RotateCcw size={15}/>:<Trash2 size={15}/>} {g.trashed?'恢复':'删除'}</Button>
           </div>
         </CardContent></Card>)}</div>
     </> : <>
@@ -661,10 +667,11 @@ function Overview() {
     </>}
     {!list.length && view.tab === "groups" && <Empty title="没有符合条件的图片组" body="调整筛选条件，或在项目中完成视频拆解。" />}
     {list.length > view.limit && <Button className="overview-more" variant="outline" onClick={() => change({limit: view.limit + 24})}>加载更多 · 已显示 {view.limit} / {list.length}</Button>}
-    {batchAction && <Modal title={batchAction==='trash'?'移入回收站':batchAction==='restore'?'恢复图片组':'确认所选素材可用'} onClose={()=>!operating && setBatchAction(null)}>
-      <p>本次 {pickedGroups.length} 组，来自 {queueProjects.length} 个来源。</p>
+    {batchAction && <Modal title={batchAction==='trash'?'移入回收站':batchAction==='restore'?'恢复图片组':'确认所选素材可用'} onClose={closeGroupAction}>
+      <p>本次 {actionGroups.length} 组，来自 {new Set(actionGroups.map((g:any)=>g.project_id)).size} 个来源。</p>
+      {groupActionTarget && <p><strong>{groupActionTarget.project_name} · 第 {groupActionTarget.group_number} 组</strong></p>}
       <p className="muted">{batchAction==='trash'?'图片组移入回收站，可恢复。不会删除源文件、已生成视频或历史任务。':batchAction==='restore'?'恢复后可重新参与筛选与生成。':'请先检查图片与人物。确认可用不会替换人物侧，不会跳过水印检查或提交生成。'}</p>
-      <Button disabled={operating} onClick={async()=>{setOperating(true);try{const result=await api('workbench_group_batch',pickedGroups,batchAction);const failed=result.filter((r:any)=>!r.ok);setBatchResult(`成功 ${result.length-failed.length} 组，失败 ${failed.length} 组${failed.length?'：'+failed.map((r:any)=>`${r.project_id}/${r.group_id}：${r.message}`).join('；'):''}`);change({picked:failed.map((r:any)=>`${r.project_id}:${r.group_id}`)});setBatchAction(null);await refresh(true);}catch(e){setBatchResult(String(e));}finally{setOperating(false);}}}>{operating?'正在处理…':'确认操作'}</Button>
+      <Button disabled={operating} onClick={async()=>{setOperating(true);try{const result=await api('workbench_group_batch',actionGroups,batchAction);const failed=result.filter((r:any)=>!r.ok);setBatchResult(`成功 ${result.length-failed.length} 组，失败 ${failed.length} 组${failed.length?'：'+failed.map((r:any)=>`${r.project_id}/${r.group_id}：${r.message}`).join('；'):''}`);const succeeded=new Set(result.filter((r:any)=>r.ok).map((r:any)=>`${r.project_id}:${r.group_id}`));setOverview((old:any)=>({...old,picked:old.picked.filter((id:string)=>!succeeded.has(id))}));setBatchAction(null);setGroupActionTarget(null);await refresh(true);}catch(e){setBatchResult(String(e));}finally{setOperating(false);}}}>{operating?'正在处理…':'确认操作'}</Button>
     </Modal>}
     {imageDetail && <Modal title={`${imageDetail.project_name} · 第${imageDetail.group_number}组`} onClose={() => setImageDetail(null)} wide><div className="overview-pair"><GlobalShot item={imageDetail} side="a" /><GlobalShot item={imageDetail} side="b" /></div><div className="row wrap"><Button disabled={imageDetail.trashed} onClick={() => startVideo(imageDetail.project_id, [imageDetail.group_id])}>仅生成本组</Button><Button variant="outline" onClick={() => goSource(imageDetail)}>回到来源图片组</Button></div></Modal>}
     {detail && <Modal title={`${detail.project_name} · ${detail.label || `第${detail.group_number}组`}`} description="查看该版本实际提交的记录；历史素材缺失时会明确提示。" onClose={() => setDetail(null)} wide>

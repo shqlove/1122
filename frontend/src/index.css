@@ -70,3 +70,5 @@ button:focus-visible, select:focus-visible, input:focus-visible, textarea:focus-
 .sidebar nav { overflow-y:auto; min-height:0; }
 .sidebar .nav-item:nth-child(7) { margin-top:14px; border-top:1px solid #e2e8f0; border-radius:0; }
 @media(max-height:700px) { .sidebar .brand { padding-top:16px; padding-bottom:12px; } .sidebar .nav-item { min-height:36px; padding-top:9px; padding-bottom:9px; } .sidebar .local-card { display:none; } }
+
+.overview-group .group-card-remove { margin-left:auto; }
