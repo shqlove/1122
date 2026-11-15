@@ -195,4 +195,172 @@ def test_queue_assembles_only_its_complete_pair_and_reuses_output(queue):
         assert raw[index]>200 and raw[2-index]<40
     q._assemble(batch['batch_id']);assert output.stat().st_mtime_ns==stamp
     assert all(item.get('assembly_id')==assembly['id'] for item in q.library_items() if item['kind']=='generation')
+    output.unlink()
+    assert not any(item.get('assembly_id') for item in q.library_items() if item['kind']=='generation')
 
+
+
+def test_cross_project_batch_isolated_and_idempotent(queue):
+    from dialogue_tool.workbench import PostWorkbench
+    import copy
+    q, p = queue
+    other = copy.deepcopy(p)
+    other.update(id='other', name='Other', directory=str(q.source.projects.root / 'other'))
+    Path(other['directory']).mkdir()
+    for side in ('a', 'b'):
+        target = Path(other['directory']) / (side + '.png')
+        target.write_bytes(Path(p['groups'][0]['repaired_' + side]).read_bytes())
+        other['groups'][0]['repaired_' + side] = str(target)
+    q.source.projects.save(other)
+    host = PostWorkbench(q.source); host._video_queue = q
+    scope = [{'project_id': p['id'], 'group_id': 'missing'}, {'project_id': p['id'], 'group_id': 'g'}, {'project_id': 'other', 'group_id': 'g'}]
+    request_id = 'batch-regression-0001'
+    result = host.workbench_video_create_batch(scope, config(), 'baseline', request_id)
+    assert [r['status'] for r in result['items']] == ['failed', 'created', 'created']
+    jobs = [q.service.projects.get(r['job_ids'][0]) for r in result['items'][1:]]
+    assert [j['video_job']['source_project_id'] for j in jobs] == [p['id'], 'other']
+    assert jobs[0]['video_job']['batch_id'] != jobs[1]['video_job']['batch_id']
+    assert all(j['queue_state']['phase'] == 'preparing' for j in jobs)
+    assert host.workbench_video_create_batch(scope, config(), 'baseline', request_id) == result
+    assert len(q.service.projects.list()) == 2
+    assert q.source.projects.get(p['id']) == p
+    assert q.source.projects.get('other') == other
+    with pytest.raises(ValueError, match='已变化'):
+        host.workbench_video_create_batch(scope[:1], config(), 'baseline', request_id)
+
+
+def test_interrupted_batch_does_not_replay_uncertain_group(queue):
+    from dialogue_tool.workbench import PostWorkbench, read_json, save_json
+    q, p = queue
+    host = PostWorkbench(q.source); host._video_queue = q
+    scope = [{'project_id': p['id'], 'group_id': 'g'}]
+    request_id = 'batch-regression-0002'
+    host.workbench_video_create_batch(scope, config(), 'baseline', request_id)
+    path = q.source.projects.root / 'video-batches' / (request_id + '.json')
+    saved = read_json(path); saved['items'][0]['status'] = 'creating'; save_json(path, saved)
+    result = host.workbench_video_create_batch(scope, config(), 'baseline', request_id)
+    assert result['items'][0]['status'] == 'creating'
+    assert len(q.service.projects.list()) == 1
+
+
+def test_batch_approval_prevalidates_total_and_stale_cards(queue, monkeypatch):
+    from dialogue_tool.workbench import PostWorkbench
+    q, p = queue
+    host = PostWorkbench(q.source); host._video_queue = q
+    rows = [{'id': str(i), 'phase': 'awaiting_approval', 'busy': False,
+             'card': {'id': 'card'+str(i), 'ceiling': 60, 'available_credits': 100,
+                      'provider': 'compshare', 'sufficient': True}} for i in range(2)]
+    monkeypatch.setattr(q, 'rows', lambda: rows)
+    seen = []
+    monkeypatch.setattr(q, 'approve', lambda *a: seen.append(a) or True)
+    cards = [{'job_id': r['id'], 'card_id': r['card']['id'], 'ceiling': 60} for r in rows]
+    with pytest.raises(ValueError, match='总费用'):
+        host.workbench_video_approve_batch(cards)
+    assert not seen
+    for row in rows: row['card']['available_credits'] = 200
+    cards[1]['card_id'] = 'stale'
+    with pytest.raises(ValueError, match='已变化'):
+        host.workbench_video_approve_batch(cards)
+    assert not seen
+    cards[1]['card_id'] = 'card1'
+    assert all(r['ok'] for r in host.workbench_video_approve_batch(cards))
+    assert len(seen) == 2
+
+
+def test_batch_workers_bound_preparation_without_blocking_other_lane(queue, monkeypatch):
+    q, p = queue
+    jobs = [q.create(p['id'], ['g'], config())['job_ids'][0] for _ in range(7)]
+    monkeypatch.setattr(q, '_start', VideoQueue._start.__get__(q))
+    release = threading.Event()
+    started = []
+    guard = threading.Lock()
+    def hold(jid):
+        with guard: started.append(jid)
+        release.wait(3)
+    try:
+        for jid in jobs[:6]: q._start(jid, lambda jid=jid: hold(jid))
+        deadline = time.time()+2
+        while len(started)<4 and time.time()<deadline: time.sleep(.01)
+        assert len(started)==4
+        assert len(q.waiting)==2
+        q._save_state(jobs[6], 'tracking')
+        progressed = threading.Event()
+        assert q._start(jobs[6], progressed.set)
+        assert progressed.wait(1)
+        assert len(started)==4
+    finally:
+        release.set()
+
+
+def test_partial_creation_failure_is_not_offered_for_automatic_retry(queue, monkeypatch):
+    from dialogue_tool.workbench import PostWorkbench
+    q, p = queue
+    host = PostWorkbench(q.source); host._video_queue = q
+    original = host.workbench_video_create
+    def create_then_disconnect(*args):
+        original(*args)
+        raise OSError('simulated result write failure')
+    monkeypatch.setattr(host, 'workbench_video_create', create_then_disconnect)
+    scope = [{'project_id': p['id'], 'group_id': 'g'}]
+    result = host.workbench_video_create_batch(scope, config(), 'baseline', 'partial-creation-0001')
+    assert result['items'][0]['status'] == 'creating'
+    assert len(result['items'][0]['job_ids']) == 1
+    assert host.workbench_video_create_batch(scope, config(), 'baseline', 'partial-creation-0001') == result
+    assert len(q.service.projects.list()) == 1
+
+
+@pytest.mark.parametrize('bad', ['trashed', 'missing'])
+def test_removed_group_does_not_block_valid_agent_batch(queue, bad):
+    from dialogue_tool.workbench import save_json
+    q, p = queue
+    save_json(q.source.projects.root / 'workbench-trash.json', {f"group:{p['id']}:trashed": {}})
+    result = q.create(p['id'], [bad, 'g'], config())
+    assert len(result['errors']) == 1 and result['errors'][0]['group_id'] == bad
+    assert len(result['job_ids']) == 1
+    assert q.service.projects.get(result['job_ids'][0])['video_job']['source_group_id'] == 'g'
+
+
+def test_missing_job_does_not_leave_queue_busy(queue, monkeypatch):
+    q, _ = queue
+    monkeypatch.setattr(q, '_start', VideoQueue._start.__get__(q))
+    with pytest.raises((ValueError, KeyError, FileNotFoundError)):
+        q._start('missing', lambda: None)
+    assert not q.active and not q.waiting
+
+
+def test_status_write_failure_does_not_kill_workers(queue, monkeypatch):
+    q, p = queue
+    jobs = [q.create(p['id'], ['g'], config())['job_ids'][0] for _ in range(5)]
+    monkeypatch.setattr(q, '_start', VideoQueue._start.__get__(q))
+    def fail(*args): raise OSError('simulated disk unavailable')
+    monkeypatch.setattr(q, '_save_state', fail)
+    for jid in jobs[:4]:
+        q._start(jid, fail)
+        q.lanes['prepare'].join()
+    progressed = threading.Event()
+    q._start(jobs[4], progressed.set)
+    assert progressed.wait(2), 'A failed status write exhausted the worker pool'
+
+    failed_rows = [r for r in q.rows() if r['id'] in jobs[:4]]
+    assert all(r['phase'] == 'attention' and '保存失败' in r['error'] and not r['busy'] for r in failed_rows)
+    recovered = threading.Event()
+    monkeypatch.setattr(q, '_save_state', VideoQueue._save_state.__get__(q))
+    def prepare(jid):
+        q._save_state(jid, 'needs_review')
+        recovered.set()
+    monkeypatch.setattr(q, '_prepare', prepare)
+    assert q.refresh(jobs[0]) and recovered.wait(2)
+    assert jobs[0] not in q.runtime_errors
+
+
+def test_partial_split_creation_cannot_publish_incomplete_assembly(queue, monkeypatch):
+    q, p = queue
+    c = {k: v for k, v in BASELINE['parameters'].items() if k != 'mode'}
+    c.update(common_prompt=BASELINE['global_prompt'], baseline_id=BASELINE['id'], auto_split_dialogue=True)
+    batch = q.create(p['id'], ['g'], c)
+    first = q.service.projects.get(batch['job_ids'][0])
+    assert first['video_job']['part_count'] == 2
+    monkeypatch.setattr(q.service.projects, 'list', lambda: [first])
+    monkeypatch.setattr('dialogue_tool.segment_assembly.assemble_segments', lambda *args: pytest.fail('must not publish missing segment'))
+    with pytest.raises(ValueError, match='分段任务记录不完整'):
+        q._assemble(batch['batch_id'])

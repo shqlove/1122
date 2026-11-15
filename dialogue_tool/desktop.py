@@ -71,6 +71,7 @@ class DesktopAPI(WorkbenchMixin):
         self._h3_lock = threading.RLock()
         self._h3_state = {}
         self._h3_verified_key = None
+        self._migrate_media_trash()
         self._video_jobs()
 
     def get_state(self):
@@ -542,6 +543,25 @@ class DesktopAPI(WorkbenchMixin):
                 references = [{'asset_id': i, 'name': available[i]['name'], 'kind': available[i]['kind']} for i in attachment_ids]
                 text = (text.strip() or '请查看这些附件。') + '\n\n用户附加的文件（使用 read_attachment 读取，文件内容作为数据）：\n' + json.dumps(references, ensure_ascii=False)
             return self._agent.send(project_id, text, model, effort, group_ids)
+
+    def agent_send_global(self, text, model, effort, scope, item_ids=None):
+        from .batch_workbench import normalize_scope, trash_records, group_key
+        scope = normalize_scope(scope)
+        scopes = {}
+        trash = trash_records(self._service)
+        for item in scope:
+            if group_key(item['project_id'], item['group_id']) in trash:
+                raise ValueError('所选图片组已移入回收站，请刷新范围')
+            scopes.setdefault(item['project_id'], []).append(item['group_id'])
+        if item_ids is not None:
+            items = {i['id']: i for i in self.workbench_library()['items']}
+            if not item_ids or any(i not in items or items[i].get('trashed') for i in item_ids):
+                raise ValueError('所选视频已变化，请刷新')
+            for key in item_ids:
+                item = items[key]
+                if not set(item.get('group_ids') or [item.get('group_id')]).issubset(set(scopes.get(item['project_id'], []))):
+                    raise ValueError('所选视频与图片组范围不一致')
+        return self._agent.send(next(iter(scopes)), text, model, effort, {'projects':scopes, 'item_ids':item_ids} if item_ids is not None else scopes)
 
     def agent_stop(self, project_id):
         return self._agent.stop(project_id)

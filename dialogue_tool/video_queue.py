@@ -1,5 +1,7 @@
 """Independent video jobs: immutable inputs, one quote and submission identity per clip."""
 import copy
+import logging
+import queue
 import shutil
 import threading
 import time
@@ -36,6 +38,9 @@ class VideoQueue:
         self.api = WorkflowAPI(self.service)
         self.lock = threading.RLock()
         self.active = set()
+        self.waiting = set()
+        self.runtime_errors = {}
+        self.lanes = {}
         self.stop = threading.Event()
         self.assembly_lock = threading.Lock()
 
@@ -43,21 +48,46 @@ class VideoQueue:
         p = self.service.projects.get(jid)
         p['queue_state'] = {'phase': phase, 'error': error, 'updated_at': time.time()}
         self.service.projects.save(p)
+        self.runtime_errors.pop(jid, None)
 
     def _start(self, jid, operation):
         with self.lock:
             if jid in self.active:
                 return False
+            job = self.service.projects.get(jid)
             self.active.add(jid)
+            self.waiting.add(jid)
+            phase = job.get('queue_state', {}).get('phase')
+            lane = 'tracking' if phase in ('submitting', 'tracking') or any(t.get('submit_id') for t in job.get('generation', {}).get('tasks', {}).values()) else 'prepare'
+            if lane not in self.lanes:
+                pending = self.lanes[lane] = queue.Queue()
+                def worker():
+                    while not self.stop.is_set():
+                        try: task = pending.get(timeout=.2)
+                        except queue.Empty: continue
+                        try: task()
+                        except Exception:
+                            # A failed status write must not permanently remove a worker.
+                            logging.getLogger(__name__).exception('Video worker could not record task failure')
+                        finally: pending.task_done()
+                for _ in range(8 if lane == 'tracking' else 4):
+                    threading.Thread(target=worker, daemon=True).start()
         def work():
+            with self.lock:
+                self.waiting.discard(jid)
             try:
-                operation()
+                if not self.stop.is_set():
+                    operation()
             except Exception as exc:
-                self._save_state(jid, 'attention', str(exc))
+                try:
+                    self._save_state(jid, 'attention', str(exc))
+                except Exception as save_error:
+                    self.runtime_errors[jid] = f'{exc}；错误状态保存失败：{save_error}'
+                    raise
             finally:
                 with self.lock:
                     self.active.discard(jid)
-        threading.Thread(target=work, daemon=True).start()
+        self.lanes[lane].put(work)
         return True
 
     def _copy_group(self, source, group, folder, voice=None):
@@ -84,25 +114,31 @@ class VideoQueue:
             bindings.update(voice_path=str(target), voice_name=source_voice.name)
         return result
 
-    def create(self, source_id, group_ids, config, voice_source='baseline'):
+    def create(self, source_id, group_ids, config, voice_source='baseline', creation_id=None):
         if voice_source not in ('baseline', 'group'):
             raise ValueError('请选择成功模板音色或图片组音色')
         if config.get('baseline_id') == 'h3-first-v1' and voice_source != 'baseline':
             raise ValueError('成功模板使用原始参考音色，请先切换手动配置')
+        from .batch_workbench import trash_records, group_key
+        trash = trash_records(self.source)
         source = self.source.projects.get(source_id)
         groups = {g['id']: g for g in source['groups']}
-        if not group_ids or len(set(group_ids)) != len(group_ids) or not set(group_ids).issubset(groups):
+        if not group_ids or len(set(group_ids)) != len(group_ids):
             raise ValueError('请选择有效的来源图片组')
         if len(group_ids) > 1:
             result = {'job_ids': [], 'batch_ids': [], 'errors': []}
             for gid in group_ids:
                 try:
-                    created = self.create(source_id, [gid], config, voice_source)
+                    created = self.create(source_id, [gid], config, voice_source, creation_id)
                     result['job_ids'].extend(created['job_ids'])
                     result['batch_ids'].append(created['batch_id'])
                 except Exception as exc:
                     result['errors'].append({'group_id': gid, 'message': str(exc)})
             return result
+        if group_key(source_id, group_ids[0]) in trash:
+            raise ValueError('图片组已移入回收站，请先恢复')
+        if group_ids[0] not in groups:
+            raise ValueError('请选择有效的来源图片组')
         batch_id = uuid.uuid4().hex
         batch_folder = self.service.projects.root / batch_id
         batch_folder.mkdir()
@@ -138,7 +174,7 @@ class VideoQueue:
                     job_folder.mkdir()
                     job['groups'] = [self._copy_group(p, p['groups'][0], job_folder)]
                 job.update(id=jid, directory=str(job_folder), created_at=time.time(), video_job={
-                    'batch_id': batch_id, 'source_project_id': source_id, 'source_project_name': source['name'],
+                    'batch_id': batch_id, 'creation_id': creation_id, 'source_project_id': source_id, 'source_project_name': source['name'],
                     'source_group_id': gid, 'group_number': next(i for i,g in enumerate(source['groups'],1) if g['id']==gid),
                     'part': index, 'part_count': len(prompts), 'requested_config': config, 'voice_source': voice_source})
                 job['generation'].update(global_prompt=prompt, baseline_id='custom')
@@ -232,7 +268,7 @@ class VideoQueue:
         tasks = p.get('generation', {}).get('tasks', {})
         if any(t.get('submit_id') for t in tasks.values()):
             return self._start(jid, lambda: self._watch(jid))
-        if p['queue_state']['phase'] in ('attention', 'awaiting_approval'):
+        if jid in self.runtime_errors or p['queue_state']['phase'] in ('attention', 'awaiting_approval'):
             return self._start(jid, lambda: self._prepare(jid))
         return False
 
@@ -275,6 +311,8 @@ class VideoQueue:
                 parent['generation']['tasks'][job['id']] = task
                 gid = meta['source_group_id']
                 parts = sorted([p for p in jobs if p['video_job']['source_group_id']==gid], key=lambda p:p['video_job']['part'])
+                if [p['video_job']['part'] for p in parts] != list(range(1, meta['part_count'] + 1)) or any(p['video_job']['part_count'] != meta['part_count'] for p in parts):
+                    raise ValueError('分段任务记录不完整，请核对本组任务；不会把缺段视频标记为完整原片')
                 plan = parent['generation']['dialogue_plans'].setdefault(gid, {'source_group_id': gid, 'assembly': {}})
                 plan['parts'] = [{'group_id':p['id'], 'index':p['video_job']['part']} for p in parts]
                 plan['assembly']['order'] = [p['id'] for p in parts]
@@ -304,12 +342,15 @@ class VideoQueue:
             cfg = p['generation']
             task = next(iter(cfg.get('tasks', {}).values()), {})
             params = task.get('request_snapshot', {}).get('parameters', cfg)
-            rows.append({'id': p['id'], **p['video_job'], **p['queue_state'], 'created_at': cfg.get('submitted_at') or p['created_at'],
+            runtime_error = self.runtime_errors.get(p['id'])
+            state = {'phase': 'attention', 'error': runtime_error} if runtime_error else p['queue_state']
+            rows.append({'id': p['id'], **p['video_job'], **state, 'created_at': cfg.get('submitted_at') or p['created_at'],
                 'model': params['model'], 'duration': params['duration'], 'resolution': params['resolution'], 'ratio': params['ratio'],
                 'prompt': task.get('request_snapshot', {}).get('bound_prompt') or cfg['global_prompt'],
                 'role_bindings': task.get('request_snapshot', {}).get('role_bindings', task.get('references', [])),
-                'context_ir': params.get('use_context_ir'), 'card': cfg.get('pending_approval'), 'submit_id': task.get('submit_id'),
+                'queued': p['id'] in self.waiting, 'context_ir': params.get('use_context_ir'), 'card': cfg.get('pending_approval'), 'submit_id': task.get('submit_id'),
                 'task_id': task.get('task_id'), 'task_status': task.get('status'), 'output': task.get('output'),
+                'archive_path': task.get('archive_output'),
                 'task_error': task.get('submit_error') or task.get('error') or task.get('download_error') or task.get('query_error'),
                 'busy': p['id'] in self.active,
                 'references': [{'side': side, 'path': p['groups'][0]['repaired_' + side]} for side in ('a','b')] +
@@ -327,7 +368,8 @@ class VideoQueue:
                     continue
                 meta = plan['origin']
                 key = 'video-assembly:' + p['id'] + ':' + meta['source_group_id']
-                links.update({part['group_id']: key for part in plan['parts']})
+                if Path(out['output']).is_file():
+                    links.update({part['group_id']: key for part in plan['parts']})
                 items.append({'id':key, 'kind':'assembly', 'project_id':meta['source_project_id'], 'project_name':meta['source_project_name'],
                     'group_id':meta['source_group_id'], 'group_ids':[meta['source_group_id']], 'group_number':meta['group_number'],
                     'label':'完整拼接', 'status':'downloaded', 'path':out['output'], 'available':Path(out['output']).is_file(),
@@ -340,7 +382,8 @@ class VideoQueue:
         for row in self.rows():
             items.append({'id':'video-job:'+row['id'], 'kind':'generation', 'project_id':row['source_project_id'],
                 'project_name':row['source_project_name'], 'group_id':row['source_group_id'], 'group_number':row['group_number'],
-                'status':row['task_status'] or row['phase'], 'path':row['output'], 'available':bool(row['output'] and Path(row['output']).is_file()),
+                'status':row['task_status'] or row['phase'], 'path':row['output'], 'archive_path':row['archive_path'],
+                'available':bool(row['output'] and Path(row['output']).is_file()),
                 'duration':row['duration'], 'model':row['model'], 'resolution':row['resolution'], 'ratio':row['ratio'],
                 'created_at':row['created_at'], 'submit_id':row['submit_id'], 'task_id':row['task_id'],
                 'queue_phase':row['phase'], 'error':row.get('error') or row['task_error'], 'job_id':row['id'],

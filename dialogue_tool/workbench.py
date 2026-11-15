@@ -43,7 +43,37 @@ def save_json(path, value):
         tmp.unlink(missing_ok=True)
 
 
-class WorkbenchMixin:
+from .batch_workbench import BatchWorkbenchMixin, trash_records, group_key
+
+
+def media_identity(kind, project_id, group_id, record, fallback):
+    # Round indices move when a current round is archived; identities must not.
+    identity = record.get('submit_id') or record.get('task_id') or record.get('output')
+    if not identity:
+        return fallback
+    digest = hashlib.sha256(str(identity).encode()).hexdigest()[:32]
+    return f"{kind}:{project_id}:{digest}:{group_id or ''}"
+
+
+class WorkbenchMixin(BatchWorkbenchMixin):
+    def _migrate_media_trash(self):
+        # Run on application startup, never from the read-only library/task view.
+        from .project_run import workflow_lock
+        from .batch_workbench import _batch_lock
+        with _batch_lock, workflow_lock(self._service.projects.root):
+            records = trash_records(self._service)
+            if not any(key.startswith(('media:generation:', 'media:assembly:')) for key in records):
+                return
+            changed = False
+            for item in self.workbench_library()['items']:
+                old = 'media:' + item.get('legacy_id', item['id'])
+                new = 'media:' + item['id']
+                if old != new and old in records:
+                    records.setdefault(new, records.pop(old))
+                    changed = True
+            if changed:
+                save_json(self._service.projects.root / 'workbench-trash.json', records)
+
     def _video_jobs(self):
         from .video_queue import queue_for
         with self.lock:
@@ -52,10 +82,11 @@ class WorkbenchMixin:
             return self._video_queue
 
     def workbench_video_sources(self):
+        trash = trash_records(self._service)
         return [{'id': p['id'], 'name': p['name'], 'groups': [
             {'id': g['id'], 'number': i, 'needs_review': bool(g.get('needs_review')),
              'voice': g.get('generation_bindings', {}).get('voice_name'),
-             'selected': g.get('selected', False)} for i, g in enumerate(p.get('groups', []), 1)]}
+             'selected': g.get('selected', False)} for i, g in enumerate(p.get('groups', []), 1) if group_key(p['id'], g['id']) not in trash]}
             for p in self._service.projects.list()]
 
     def workbench_video_preset(self):
@@ -80,8 +111,8 @@ class WorkbenchMixin:
                            'ratios': flags['--ratio']['values'], 'resolutions': flags['--resolution']['values']})
         return result
 
-    def workbench_video_create(self, project_id, group_ids, config, voice_source='baseline'):
-        return self._video_jobs().create(project_id, group_ids, config, voice_source)
+    def workbench_video_create(self, project_id, group_ids, config, voice_source='baseline', creation_id=None):
+        return self._video_jobs().create(project_id, group_ids, config, voice_source, creation_id)
 
     def workbench_video_jobs(self):
         from .media_server import MediaServer
@@ -198,14 +229,14 @@ class WorkbenchMixin:
                 plans = assembly_plans(cfg)
                 def assembly_key(plan):
                     suffix = ':' + plan['source_group_id'] if plan in cfg.get('dialogue_plans', {}).values() else ''
-                    return f"assembly:{p['id']}:{idx}{suffix}"
+                    return media_identity("assembly", p["id"], plan.get("source_group_id"), plan.get("assembly", {}), f"assembly:{p['id']}:{idx}{suffix}")
                 assembled_groups = {part['group_id']: assembly_key(plan) for plan in plans
                     if plan.get('assembly', {}).get('output') and Path(plan['assembly']['output']).is_file()
                     for part in plan.get('parts', [])}
                 for gid, task in cfg.get('tasks', {}).items():
-                    key = f"generation:{p['id']}:{idx}:{gid}"
+                    key = media_identity("generation", p["id"], gid, task, f"generation:{p['id']}:{idx}:{gid}")
                     params = task.get('request_snapshot', {}).get('parameters', cfg)
-                    item = {'id': key, 'kind': 'generation', 'project_id': p['id'], 'project_name': p['name'],
+                    item = {'id': key, 'legacy_id': f"generation:{p['id']}:{idx}:{gid}", 'kind': 'generation', 'project_id': p['id'], 'project_name': p['name'],
                             'group_id': task.get('source_group_id') or gid, 'task_group_id': gid,
                             'group_number': groups.get(task.get('source_group_id') or gid, 0), 'round': idx,
                             'segment': task.get('segment'),
@@ -228,7 +259,7 @@ class WorkbenchMixin:
                     assembly = plan.get('assembly', {})
                     if not assembly.get('output'):
                         continue
-                    item = {'id': assembly_key(plan), 'kind': 'assembly',
+                    item = {'id': assembly_key(plan), 'legacy_id': f"assembly:{p['id']}:{idx}" + (':' + plan['source_group_id'] if plan in cfg.get('dialogue_plans', {}).values() else ''), 'kind': 'assembly',
                             'project_id': p['id'], 'project_name': p['name'], 'round': idx,
                             'group_id': plan.get('source_group_id'),
                             'group_ids': ([plan['source_group_id']] if plan in cfg.get('dialogue_plans', {}).values()
@@ -266,8 +297,9 @@ class WorkbenchMixin:
         queue = getattr(self, '_video_queue', None) or VideoQueue(self._service)
         for item in queue.library_items():
             items.append(item)
-            if item.get('path'):
-                source_links[str(Path(item['path']).resolve()).casefold()] = item
+            for file in (item.get('path'), item.get('archive_path')):
+                if file:
+                    source_links[str(Path(file).resolve()).casefold()] = item
             if item['kind'] == 'generation':
                 for group in all_groups:
                     if group['project_id'] == item['project_id'] and group['group_id'] == item['group_id'] and item['status'] in ('downloaded', 'completed'):
@@ -316,6 +348,11 @@ class WorkbenchMixin:
                 runs.append(run)
             except (OSError, ValueError):
                 pass
+        trash = trash_records(self._service)
+        for g in all_groups:
+            g['trashed'] = group_key(g['project_id'], g['group_id']) in trash
+        for item in items:
+            item['trashed'] = 'media:' + item['id'] in trash
         items.sort(key=lambda i: i.get('created_at') or 0, reverse=True)
         return {'items': items, 'projects': projects, 'groups': all_groups, 'runs': sorted(runs, key=lambda r: r.get('started_at', 0), reverse=True),
                 'post_available': (self._post_root() / 'postprocess.py').is_file()}
@@ -481,6 +518,8 @@ class WorkbenchMixin:
             allowed = Path(cfg['inputRoot']).resolve()
             for key in item_ids:
                 item = known[key]
+                if item.get('trashed'):
+                    raise ValueError('所选视频已移入回收站，请先恢复')
                 source = item.get('source_path') if item['kind'] == 'post' else item.get('archive_path')
                 if item['kind'] == 'assembly' and item.get('available'):
                     from .video_archive import digest

@@ -4,6 +4,7 @@ from __future__ import annotations
 from .dialogue_segments import has_tasks
 
 import base64
+import copy
 import hashlib
 import io
 import json
@@ -94,8 +95,11 @@ TOOL_SCHEMAS = {name: spec for name, _, spec in TOOLS}
 
 
 def dynamic_tools():
-    return [{'type':'function','name':'workbench_'+name,'description':description,'inputSchema':schema}
-            for name,description,schema in TOOLS]
+    tools = [{'type':'function','name':'workbench_'+name,'description':description,'inputSchema':copy.deepcopy(schema)}
+             for name,description,schema in TOOLS]
+    for tool in tools:
+        tool['inputSchema']['properties']['project_id'] = {'type': 'string', 'description': '跨项目总览模式必填，取自本轮 allowed_scopes；单项目模式可省略'}
+    return tools
 
 
 def revision(project):

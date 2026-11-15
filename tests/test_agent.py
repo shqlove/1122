@@ -352,3 +352,51 @@ def test_history_search_preserves_old_memory_without_full_context_replay(project
     assert execution['finished_at'] >= execution['started_at']
     assert execution['steps'][0]['tool'] == 'read_project'
     assert execution['steps'][0]['seconds'] >= 0
+
+
+def test_global_agent_requires_explicit_source_and_enforces_each_scope(project, monkeypatch):
+    service, pid = project
+    agent = AgentManager(service)
+    seen = []
+    monkeypatch.setattr(agent.workflow, 'execute', lambda *args: seen.append(args) or {})
+    scopes = {pid: ['first'], 'other': ['second']}
+    def call(args):
+        return agent._tool(pid, {'tool': 'workbench_update_groups', 'callId': 'test', 'arguments': args}, scopes)
+    with pytest.raises(ValueError, match='allowed_scopes'):
+        call({'updates': [{'group_id': 'first'}]})
+    with pytest.raises(ValueError, match='范围'):
+        call({'project_id': pid, 'updates': [{'group_id': 'second'}]})
+    call({'project_id': pid, 'updates': [{'group_id': 'first'}]})
+    assert seen[0][0] == pid and 'project_id' not in seen[0][2]
+    with pytest.raises(ValueError, match='独立视频任务'):
+        agent._tool(pid, {'tool': 'workbench_prepare_batch', 'callId': 'bad', 'arguments': {'project_id':pid,'group_ids':['first']}}, scopes)
+
+
+def test_global_agent_post_scope_checks_exact_video_versions(project, monkeypatch):
+    from dialogue_tool.workbench import PostWorkbench
+    service, pid = project
+    agent = AgentManager(service)
+    items = [{'id':'one','project_id':pid,'group_id':'first'},
+             {'id':'two','project_id':pid,'group_id':'second'},
+             {'id':'other-version','project_id':pid,'group_id':'first'}]
+    monkeypatch.setattr(PostWorkbench,'workbench_library',lambda self:{'items':items})
+    calls = []
+    monkeypatch.setattr(PostWorkbench,'workbench_start_post',lambda self,*a:calls.append(a) or {})
+    scope = {'projects':{pid:['first','second']},'item_ids':['one','two']}
+    params = {'tool':'workbench_start_postproduction','callId':'post','arguments':{'project_id':pid,'item_ids':['one','two'],'recognize':True}}
+    assert agent._tool(pid,params,scope)['success']
+    assert calls==[(['one','two'],True)]
+    params['arguments']['item_ids']=['other-version']
+    with pytest.raises(ValueError, match='视频范围'):
+        agent._tool(pid,params,scope)
+    assert len(calls)==1
+
+
+@pytest.mark.parametrize('action', ['request_generation_channel', 'refresh_results', 'download_results', 'export_images'])
+def test_global_scope_cannot_run_unscoped_project_actions(project, monkeypatch, action):
+    service, pid = project
+    agent = AgentManager(service)
+    monkeypatch.setattr(agent.workflow, 'execute', lambda *args: pytest.fail('must not modify entire project'))
+    with pytest.raises(ValueError, match='独立视频任务'):
+        agent._tool(pid, {'tool': 'workbench_' + action, 'callId': 'scope-test',
+                         'arguments': {'project_id': pid}}, {pid: ['first']})
