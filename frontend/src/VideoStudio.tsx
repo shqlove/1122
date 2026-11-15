@@ -21,18 +21,20 @@ const publishCreation = (value:any) => {creation=value;creationListeners.forEach
 const remainingSources = (scope:VideoSource[], result:any) => scope.filter(v=>!result.items.some((x:any)=>x.status!=='failed' && x.project_id===v.project_id && x.group_id===v.group_id));
 async function createBatch(scope:VideoSource[], form:any, voiceSource:string) {
   if(creation.pending)return;
-  const signature=JSON.stringify([scope,form,voiceSource]);
-  const request=saved?.request?.signature===signature?saved.request:{signature,id:crypto.randomUUID()};
-  saved={...saved,request};
   publishCreation({pending:true,scope});
+  let request: {signature:string;id:string} | undefined;
   try {
-    const result=await api('workbench_video_create_batch',scope,form,voiceSource,request.id);
+    const signature=JSON.stringify([scope,form,voiceSource]);
+    // WebView2's about:blank HTML origin has no randomUUID; getRandomValues works there.
+    request=saved?.request?.signature===signature?saved.request:{signature,id:Array.from(crypto.getRandomValues(new Uint8Array(16)),byte=>byte.toString(16).padStart(2,'0')).join('')};
+    saved={...saved,request};
+    const result=await api('workbench_video_create_batch',scope,form,voiceSource,request!.id);
     // A fresh overview handoff while this runs is a new selection, even if IDs match.
     if(saved?.selection===scope)saved={...saved,selection:remainingSources(scope,result)};
     saved={...saved,request:null};
     publishCreation({pending:false,scope,result});
   } catch(error) {
-    publishCreation({pending:false,scope,error:`创建结果未确认：${String(error)}。保持范围和参数不变再次点击，会核对同一请求，不会重复创建。`});
+    publishCreation({pending:false,scope,error:request?`创建结果未确认：${String(error)}。保持范围和参数不变再次点击，会核对同一请求，不会重复创建。`:`创建尚未开始：${String(error)}。请重试；尚未发送后端请求。`});
   }
 }
 

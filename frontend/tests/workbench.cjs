@@ -18,7 +18,7 @@ const assert = require("node:assert/strict");
     console.log("PAGE ERROR", e.message);
   });
   global.testPage = page;
-  await page.addInitScript(() => {
+  const initializeBackend = () => {
     const p = {
       id: "p1",
       name: "插翅难逃第2集 · 验证项目",
@@ -245,13 +245,12 @@ const assert = require("node:assert/strict");
         },
       ),
     };
-  });
-  await page.goto(
-    "file:///" +
-      path
-        .resolve(__dirname, "../../validation/workbench.html")
-        .replaceAll("\\", "/"),
-  );
+  };
+  // Match pywebview.create_window(html=...): an opaque about:blank origin, not secure file://.
+  await page.goto('about:blank');
+  await page.evaluate(initializeBackend);
+  assert.deepEqual(await page.evaluate(()=>({secure:isSecureContext,uuid:typeof crypto.randomUUID})),{secure:false,uuid:'undefined'});
+  await page.setContent(fs.readFileSync(path.join(validation,'workbench.html'),'utf8'));
   await page.getByRole("heading", { name: "图片组总览", exact: true }).waitFor();
   await page.getByRole("button", {name:"导入与拆解",exact:true}).click();
   assert.equal(await page.locator(".project-card").count(), 1);
@@ -527,7 +526,9 @@ const assert = require("node:assert/strict");
   assert.deepEqual(await page.evaluate(()=>window.__unexpectedCalls || []),[]);
 
   // Full reload clears the saved form, exercising the initial configuration failure.
-  await page.reload();
+  await page.goto('about:blank');
+  await page.evaluate(initializeBackend);
+  await page.setContent(fs.readFileSync(path.join(validation,'workbench.html'),'utf8'));
   await page.getByRole('heading',{name:'图片组总览',exact:true}).waitFor();
   await page.evaluate(()=>{window.__failApi={workbench_video_preset:'测试配置读取失败'};});
   await page.getByRole('button',{name:'视频生成',exact:true}).click();
@@ -552,6 +553,14 @@ const assert = require("node:assert/strict");
   await page.getByText('本次生成：2 组 · 2 个来源',{exact:true}).waitFor();
   assert.equal(await page.locator('.batch-source').count(),2);
   const batchBefore=await page.evaluate(()=>window.__calls.length);
+  // A local setup error must surface and release the button, without calling the backend.
+  await page.evaluate(()=>{window.__originalRandomValues=crypto.getRandomValues.bind(crypto);crypto.getRandomValues=()=>{throw new Error('测试随机数初始化失败');};});
+  await page.getByRole('button',{name:'添加生成任务并报价',exact:true}).click();
+  await page.getByText(/创建尚未开始：.*测试随机数初始化失败/).waitFor();
+  assert.equal(await page.getByRole('button',{name:'添加生成任务并报价',exact:true}).isEnabled(),true);
+  assert.equal(await page.evaluate(n=>window.__calls.slice(n).filter(c=>c[0]==='workbench_video_create_batch').length,batchBefore),0);
+  await page.evaluate(()=>{crypto.getRandomValues=window.__originalRandomValues;});
+
   await page.getByRole('button',{name:'我的任务',exact:true}).click();
   await page.getByRole('button',{name:'视频生成',exact:true}).click();
   await page.getByText('本次生成：2 组 · 2 个来源',{exact:true}).waitFor();
@@ -566,6 +575,7 @@ const assert = require("node:assert/strict");
   const batchCall=await page.evaluate(n=>window.__calls.slice(n).find(c=>c[0]==='workbench_video_create_batch'),batchBefore);
   assert.deepEqual(batchCall[1],[{project_id:'p1',group_id:'g1'},{project_id:'other',group_id:'g1'}]);
   assert.equal(batchCall[2].use_context_ir,true);
+  assert.match(batchCall[4],/^[a-f0-9]{32}$/);
   assert.equal(await page.getByRole('button',{name:'添加生成任务并报价',exact:true}).isEnabled(),false);
   assert.equal(await page.evaluate(n=>window.__calls.slice(n).filter(c=>['select_project','workbench_video_approve','workbench_video_approve_batch','workbench_start_post'].includes(c[0])).length,batchBefore),0);
   // A pending creation survives unmount/remount and cannot be submitted twice.
