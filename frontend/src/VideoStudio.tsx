@@ -10,6 +10,13 @@ const h3 = {model:'MiniMax-H3', label:'MiniMax H3', min:4, max:30,
   ratios:['adaptive','21:9','16:9','4:3','1:1','3:4','9:16'], resolutions:['480P','768P','1080P','2K','4K']};
 const names: any = {preparing:'正在准备 / 报价',needs_review:'待检查参考图',awaiting_approval:'待确认费用',
   submitting:'提交中',tracking:'跟踪原任务',downloaded:'已下载',attention:'待处理'};
+const providerName = (provider:string) => provider==='compshare'?'优云智算 H3':'即梦';
+const quoteSnapshot = (row:any) => ({job_id:row.id,card_id:row.card.id,ceiling:row.card.ceiling,
+  provider:row.card.provider,available_credits:row.card.available_credits,warnings:row.card.warnings || [],
+  label:`${row.source_project_name} · 第 ${row.group_number} 组 · 第 ${row.part} 段 · ${row.id.slice(0,8)}`});
+const quoteTotals = (cards:any[]) => [...new Set(cards.map(c=>c.provider))].map(provider=>({provider,
+  total:cards.filter(c=>c.provider===provider).reduce((n,c)=>n+c.ceiling,0),
+  balance:Math.min(...cards.filter(c=>c.provider===provider).map(c=>c.available_credits))}));
 let saved: any = null;
 export type VideoSource = {project_id:string; group_id:string};
 // Creation belongs to the workbench, not to a page instance that can unmount.
@@ -69,6 +76,8 @@ export function VideoStudio({initialProjectId,initialGroupIds,onOpenTasks}: any)
   const [sourcesLoading,setSourcesLoading] = useState(true), [jobsLoaded,setJobsLoaded] = useState(false);
   const [pending,setPending] = useState<Record<string,boolean>>({});
   const editor = useRef<HTMLTextAreaElement>(null);
+  const approvalPanel = useRef<HTMLDivElement>(null);
+  useEffect(()=>{if(approval)approvalPanel.current?.scrollIntoView({block:'nearest'});},[approval]);
   const refresh = () => api('workbench_video_jobs').then(v=>{setRows(v);setJobsLoaded(true);setJobsError('');}).catch(e=>setJobsError(String(e)));
   const loadSources = () => {
     setSourceError(''); setSourcesLoading(true);
@@ -93,7 +102,7 @@ export function VideoStudio({initialProjectId,initialGroupIds,onOpenTasks}: any)
   },[creationState]);
   const created=creationState.result?.items.filter((v:any)=>v.status==='created') || [];
   const failed=creationState.result?.items.filter((v:any)=>v.status!=='created') || [];
-  const receipt=creationState.result?`已创建 ${created.length} 组、${created.reduce((n:number,v:any)=>n+v.job_ids.length,0)} 条任务；未完成 ${failed.length} 组。请在下方核对费用，尚未提交付费生成。`:'';
+  const receipt=creationState.result?`已创建 ${created.length} 组、${created.reduce((n:number,v:any)=>n+v.job_ids.length,0)} 条任务；未完成 ${failed.length} 组。报价就绪后可在顶部统一确认，尚未提交付费生成。`:'';
   const groups = sources.find(p=>p.id===pid)?.groups || [];
   const gids = selection.filter(v=>v.project_id===pid).map(v=>v.group_id);
   const validSelection = selection.length>0 && selection.some(v=>sources.find(p=>p.id===v.project_id)?.groups.some((g:any)=>g.id===v.group_id && !g.needs_review));
@@ -119,10 +128,35 @@ export function VideoStudio({initialProjectId,initialGroupIds,onOpenTasks}: any)
     update({common_prompt:form.common_prompt.slice(0,start)+text+form.common_prompt.slice(end)});
     requestAnimationFrame(()=>{el?.focus();el?.setSelectionRange(start+text.length,start+text.length);});
   };
+  const ready = rows.filter(r=>r.phase==='awaiting_approval' && r.card?.sufficient===true && !r.busy && !pending[r.id]);
+  const selectedReady = ready.filter(r=>approvedSelection.includes(r.id));
+  const totals = quoteTotals(ready.map(quoteSnapshot));
+  const approvalTotals = quoteTotals(approval || []);
+  const staleApproval = !!approval?.some(c=>!ready.some(r=>r.id===c.job_id && r.card.id===c.card_id && r.card.ceiling===c.ceiling));
+  const insufficient = approvalTotals.some(t=>t.total>t.balance);
+  const waiting = rows.filter(r=>!r.submit_id && ['preparing','needs_review','awaiting_approval','attention'].includes(r.phase) && !ready.includes(r));
   if(!form)return presetError ? <div className="notice error" role="alert">生成配置加载失败：{presetError}<Button variant="outline" onClick={loadPreset}>重试生成配置</Button></div> : <p>正在读取生成配置…</p>;
   return <div className="video-studio">
     <div className="section-heading"><span className="muted">提交进度和历史视频统一在“我的任务”查看</span><Button variant="outline" onClick={onOpenTasks}>查看我的任务</Button></div>
-    <p className="notice subtle">素材来自图片组，生成任务独立保存。逐条确认费用，其他任务和项目分析不会阻塞这里。分段完成后自动合并原片，后期另行开始。</p>
+    <p className="notice subtle">素材来自图片组，生成任务独立保存。费用可统一确认，任务逐条执行；其他任务和项目分析不会阻塞这里。分段完成后自动合并原片，后期另行开始。</p>
+    {jobsLoaded && <section className="batch-scope" aria-label="当前报价汇总">
+      <div className="section-heading wrap"><h2>当前可确认报价 · {ready.length} 条</h2><Button disabled={!ready.length || !!pending.batch || !!approval || !!jobsError} onClick={()=>setApproval(ready.map(quoteSnapshot))}>确认全部报价 · {ready.length} 条</Button></div>
+      {totals.map(t=><p key={t.provider}><strong>{providerName(t.provider)}：合计 {t.total} 积分上限</strong> · 可用 {t.balance}{t.total>t.balance && ' · 合计超出余额，请减少所选任务或充值'}</p>)}
+      <p className="muted">汇总全部来源的待确认任务，不需要逐条勾选。核对明细后一次提交；各平台积分分别计算。</p>
+      {!!waiting.length && <p>另有 {waiting.length} 条暂未纳入：{[...new Set(waiting.map(r=>r.phase))].map(phase=>`${names[phase]} ${waiting.filter(r=>r.phase===phase).length} 条`).join('、')}。{waiting.some(r=>r.phase==='awaiting_approval') && '待确认费用但未纳入的任务正在处理或余额不足。'}</p>}
+      {!!jobsError && <p className="notice error">任务状态读取失败，请先刷新记录再确认费用。</p>}
+    </section>}
+    {approval && <div ref={approvalPanel} className="approval batch-scope" role="region" aria-label="批量费用确认">
+      <h3>确认本次提交 · {approval.length} 条</h3>
+      <p className="muted">仅提交以下任务，后续新报价不会自动加入本次确认。</p>
+      {approval.map(c=><section key={c.job_id} style={{padding:'8px 0'}}><p>{c.label} · {providerName(c.provider)} · {c.ceiling} 积分上限</p>{c.warnings.map((w:any,i:number)=><p className="notice" key={i}>{typeof w==='string'?w:w.message}</p>)}</section>)}
+      {approvalTotals.map(t=><p key={t.provider}><strong>{providerName(t.provider)}：合计 {t.total} 积分上限</strong> · 可用 {t.balance}</p>)}
+      {insufficient && <p role="alert">合计超出对应平台余额，请取消后减少所选任务，或充值后刷新报价。</p>}
+      {(staleApproval || jobsError) && !pending.batch && <p role="alert">任务或报价状态已变化或暂不可用，请取消后刷新记录，重新核对。</p>}
+      {approval.length>500 && <p role="alert">每次最多确认 500 条，请取消后分批选择任务。</p>}
+      <Button disabled={!approval.length || approval.length>500 || !!pending.batch || staleApproval || !!jobsError || insufficient} onClick={()=>action('batch',async()=>{const result=await api('workbench_video_approve_batch',approval.map(({job_id,card_id,ceiling})=>({job_id,card_id,ceiling})));setApproval(null);setApprovedSelection([]);const failed=result.filter((r:any)=>!r.ok);if(failed.length)setError(failed.map((r:any)=>`${r.id}：${r.message}`).join('；'));})}>{pending.batch?'正在逐条提交…':`确认费用并提交这 ${approval.length} 条`}</Button>
+      <Button variant="outline" disabled={!!pending.batch} onClick={()=>setApproval(null)}>取消</Button>
+    </div>}
     {error && <p className="notice error" role="alert">{error}</p>}
     {creationState.error && <p className="notice error" role="alert">{creationState.error}</p>}
     {!!failed.length && <p className="notice error" role="alert">{failed.map((v:any)=>`${scopeLabel(v)}：${v.message}`).join('；')}</p>}
@@ -179,17 +213,10 @@ export function VideoStudio({initialProjectId,initialGroupIds,onOpenTasks}: any)
     {!jobsLoaded && !jobsError && <p className="muted">正在读取任务记录…</p>}
     {jobsLoaded && !jobsError && !rows.length && <p className="muted">添加任务后，每条视频会在这里单独显示报价和提交按钮。</p>}
     <div className="batch-toolbar">
-      <Button variant="outline" onClick={()=>setApprovedSelection(rows.filter(r=>r.phase==='awaiting_approval' && r.card?.sufficient && !r.busy).map(r=>r.id))}>选择可提交任务</Button>
+      <Button variant="outline" onClick={()=>setApprovedSelection(ready.map(r=>r.id))}>选择可提交任务</Button>
       <Button variant="ghost" onClick={()=>setApprovedSelection([])}>清空任务选择</Button>
-      <Button disabled={!approvedSelection.length || !!pending.batch} onClick={()=>setApproval(rows.filter(r=>approvedSelection.includes(r.id) && r.phase==='awaiting_approval' && !r.busy).map(r=>({job_id:r.id,card_id:r.card.id,ceiling:r.card.ceiling,provider:r.card.provider,label:`${r.source_project_name} · 第 ${r.group_number} 组 · 第 ${r.part} 段`})))}>核对所选费用 · {approvedSelection.length} 条</Button>
+      <Button disabled={!selectedReady.length || !!pending.batch || !!approval || !!jobsError} onClick={()=>setApproval(selectedReady.map(quoteSnapshot))}>核对所选费用 · {selectedReady.length} 条</Button>
     </div>
-    {approval && <div className="approval batch-scope" role="region" aria-label="批量费用确认">
-      <h3>确认本次提交 · {approval.length} 条</h3>
-      {approval.map(c=><p key={c.job_id}>{c.label} · {c.ceiling} 积分上限</p>)}
-      {[...new Set(approval.map(c=>c.provider))].map(provider=><p key={provider}><strong>{provider==='compshare'?'优云智算 H3':'即梦'}：合计 {approval.filter(c=>c.provider===provider).reduce((n,c)=>n+c.ceiling,0)} 积分上限</strong></p>)}
-      <Button disabled={!approval.length || !!pending.batch} onClick={()=>action('batch',async()=>{const result=await api('workbench_video_approve_batch',approval.map(({job_id,card_id,ceiling})=>({job_id,card_id,ceiling})));setApproval(null);setApprovedSelection([]);const failed=result.filter((r:any)=>!r.ok);if(failed.length)setError(failed.map((r:any)=>`${r.id}：${r.message}`).join('；'));})}>确认费用并提交这 {approval.length} 条</Button>
-      <Button variant="outline" disabled={!!pending.batch} onClick={()=>setApproval(null)}>取消</Button>
-    </div>}
     {rows.map(row=><Card key={row.id}><CardContent>
       {row.phase==='awaiting_approval' && <label className="check-label"><input type="checkbox" aria-label={`选择任务 ${row.id}`} disabled={row.busy || !row.card?.sufficient} checked={approvedSelection.includes(row.id)} onChange={e=>setApprovedSelection(ids=>e.target.checked?[...ids,row.id]:ids.filter(id=>id!==row.id))}/>加入批量提交</label>}
       <div className="section-heading"><h3>{row.source_project_name} · 第 {row.group_number} 组 · 第 {row.part}/{row.part_count} 段</h3><Badge variant="secondary">{row.queued?'等待处理槽位':names[row.phase] || row.phase}</Badge></div>
@@ -206,7 +233,7 @@ export function VideoStudio({initialProjectId,initialGroupIds,onOpenTasks}: any)
         <p><strong>{row.card.ceiling} 积分上限</strong> · 可用 {row.card.available_credits} · 仅本条</p>
         {row.card.provider==='compshare' && <p>Context-IR：{row.card.use_context_ir?'开启':'关闭'} · 音轨：{row.card.mute_audio?'无声':'保留'}</p>}
         {(row.card.warnings || []).map((w:any,i:number)=><p key={i} className="notice">{typeof w==='string'?w:w.message}</p>)}
-        <Button disabled={pending[row.id] || row.busy || row.card.sufficient!==true} onClick={()=>action(row.id,()=>api('workbench_video_approve',row.id,row.card.id,row.card.ceiling))}>确认并提交本条 · {row.card.ceiling} 积分</Button>
+        <Button disabled={!!approval || pending.batch || pending[row.id] || row.busy || row.card.sufficient!==true || !!jobsError} onClick={()=>action(row.id,()=>api('workbench_video_approve',row.id,row.card.id,row.card.ceiling))}>确认并提交本条 · {row.card.ceiling} 积分</Button>
         <Button variant="outline" disabled={pending[row.id] || row.busy} onClick={()=>action(row.id,()=>api('workbench_video_refresh',row.id))}>刷新本条报价</Button>
       </div>}
       {row.phase==='attention' && <Button disabled={row.busy || pending[row.id]} onClick={()=>action(row.id,()=>api('workbench_video_refresh',row.id))}>{row.submit_id?'查询原任务':'继续本条报价'}</Button>}

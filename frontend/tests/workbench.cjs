@@ -539,6 +539,7 @@ const assert = require("node:assert/strict");
   await page.getByRole('button',{name:'来源图片组',exact:true}).click();
   await page.evaluate(()=>{window.__failApi={workbench_group_image:'测试图片读取失败'};});
   await page.getByRole('button',{name:'去生成',exact:true}).click();
+  await page.getByRole('region',{name:'本次生成范围'}).scrollIntoViewIfNeeded();
   await page.getByRole('button',{name:'重试图片 A',exact:true}).waitFor();
   await page.evaluate(()=>{window.__failApi={};});
   await page.getByRole('button',{name:'重试图片 A',exact:true}).click();
@@ -571,7 +572,7 @@ const assert = require("node:assert/strict");
   assert.ok(await page.locator('.main-content').evaluate(el=>el.scrollWidth<=el.clientWidth+1));
   await page.screenshot({path:path.join(validation,'batch-generation-scope.png')});
   await page.getByRole('button',{name:'添加生成任务并报价',exact:true}).click();
-  await page.getByText('已创建 2 组、2 条任务；未完成 0 组。请在下方核对费用，尚未提交付费生成。',{exact:true}).waitFor();
+  await page.getByText('已创建 2 组、2 条任务；未完成 0 组。报价就绪后可在顶部统一确认，尚未提交付费生成。',{exact:true}).waitFor();
   const batchCall=await page.evaluate(n=>window.__calls.slice(n).find(c=>c[0]==='workbench_video_create_batch'),batchBefore);
   assert.deepEqual(batchCall[1],[{project_id:'p1',group_id:'g1'},{project_id:'other',group_id:'g1'}]);
   assert.equal(batchCall[2].use_context_ir,true);
@@ -622,6 +623,57 @@ const assert = require("node:assert/strict");
   await page.getByRole('region',{name:'批量费用确认'}).waitFor();
   await page.getByRole('button',{name:'取消',exact:true}).click();
   assert.equal(await page.evaluate(n=>window.__calls.slice(n).filter(c=>c[0]==='workbench_video_approve_batch').length,batchBefore),0);
+  // All-current confirmation needs no selection; balances stay separate by platform.
+  await page.evaluate(()=>{
+    const base=window.__videoJobs[0];
+    window.__videoJobs=[
+      {...base,id:'all-h3',phase:'awaiting_approval',card:{id:'h3-card',ceiling:155,available_credits:500,sufficient:true,provider:'compshare',warnings:['测试报价提醒']}},
+      {...base,id:'all-dreamina',phase:'awaiting_approval',card:{id:'dreamina-card',ceiling:60,available_credits:200,sufficient:true,provider:'dreamina'}},
+      {...base,id:'unreviewed',phase:'needs_review',card:null},
+      {...base,id:'busy-quote',phase:'awaiting_approval',busy:true},
+      {...base,id:'insufficient-quote',phase:'awaiting_approval',card:{...base.card,sufficient:false}},
+    ];
+  });
+  await page.getByRole('button',{name:'刷新记录',exact:true}).click();
+  const quoteSummary=page.getByRole('region',{name:'当前报价汇总'});
+  await quoteSummary.getByRole('button',{name:'确认全部报价 · 2 条',exact:true}).waitFor();
+  assert.ok((await quoteSummary.textContent()).includes('优云智算 H3：合计 155 积分上限'));
+  assert.ok((await quoteSummary.textContent()).includes('即梦：合计 60 积分上限'));
+  assert.ok((await quoteSummary.textContent()).includes('另有 3 条暂未纳入'));
+  await quoteSummary.getByRole('button',{name:'确认全部报价 · 2 条',exact:true}).click();
+  const quoteReview=page.getByRole('region',{name:'批量费用确认'});
+  await quoteReview.getByText('测试报价提醒',{exact:true}).waitFor();
+  // Newly completed quotes do not enlarge the captured payment scope.
+  await page.evaluate(()=>window.__videoJobs.push({...window.__videoJobs[0],id:'later-quote',card:{...window.__videoJobs[0].card,id:'later-card'}}));
+  await page.getByRole('button',{name:'刷新记录',exact:true}).click();
+  await quoteSummary.getByRole('button',{name:'确认全部报价 · 3 条',exact:true}).waitFor();
+  await quoteReview.getByRole('button',{name:'确认费用并提交这 2 条',exact:true}).click();
+  await quoteReview.waitFor({state:'hidden'});
+  assert.deepEqual(await page.evaluate(()=>window.__calls.filter(c=>c[0]==='workbench_video_approve_batch').at(-1)[1]),[
+    {job_id:'all-h3',card_id:'h3-card',ceiling:155},
+    {job_id:'all-dreamina',card_id:'dreamina-card',ceiling:60},
+  ]);
+  assert.equal(await page.evaluate(()=>window.__videoJobs.find(j=>j.id==='later-quote').phase),'awaiting_approval');
+  // An updated card invalidates an open confirmation instead of approving a new price.
+  await quoteSummary.getByRole('button',{name:'确认全部报价 · 1 条',exact:true}).click();
+  await page.evaluate(()=>{window.__videoJobs.find(j=>j.id==='later-quote').card.id='requoted-card';});
+  await page.getByRole('button',{name:'刷新记录',exact:true}).click();
+  await quoteReview.getByText('任务或报价状态已变化或暂不可用，请取消后刷新记录，重新核对。',{exact:true}).waitFor();
+  assert.equal(await quoteReview.getByRole('button',{name:'确认费用并提交这 1 条',exact:true}).isEnabled(),false);
+  await quoteReview.getByRole('button',{name:'取消',exact:true}).click();
+  // Individually sufficient quotes can exceed the shared platform balance together.
+  await page.evaluate(()=>{
+    const row=window.__videoJobs.find(j=>j.id==='later-quote');
+    row.card.available_credits=200;
+    window.__videoJobs.push({...row,id:'over-total',card:{...row.card,id:'over-total-card'}});
+  });
+  await page.getByRole('button',{name:'刷新记录',exact:true}).click();
+  await quoteSummary.getByRole('button',{name:'确认全部报价 · 2 条',exact:true}).click();
+  await quoteReview.getByText('合计超出对应平台余额，请取消后减少所选任务，或充值后刷新报价。',{exact:true}).waitFor();
+  assert.equal(await quoteReview.getByRole('button',{name:'确认费用并提交这 2 条',exact:true}).isEnabled(),false);
+  await page.screenshot({path:path.join(validation,'all-quotes-confirmation.png')});
+  await quoteReview.getByRole('button',{name:'取消',exact:true}).click();
+  assert.equal(await page.evaluate(n=>window.__calls.slice(n).filter(c=>c[0]==='workbench_video_approve_batch').length,batchBefore),1);
   // Recycle and restore remain available without switching the current project.
   await page.getByRole('button',{name:'图片组总览',exact:true}).click();
   await page.getByRole('button',{name:'移入回收站',exact:true}).click();
