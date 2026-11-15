@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { api } from './lib/api';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
@@ -12,6 +12,30 @@ const names: any = {preparing:'正在准备 / 报价',needs_review:'待检查参
   submitting:'提交中',tracking:'跟踪原任务',downloaded:'已下载',attention:'待处理'};
 let saved: any = null;
 export type VideoSource = {project_id:string; group_id:string};
+// Creation belongs to the workbench, not to a page instance that can unmount.
+let creation: any = {pending:false};
+const creationListeners = new Set<()=>void>();
+const subscribeCreation = (listener:()=>void) => {creationListeners.add(listener);return()=>{creationListeners.delete(listener);};};
+const creationSnapshot = () => creation;
+const publishCreation = (value:any) => {creation=value;creationListeners.forEach(listener=>listener());};
+const remainingSources = (scope:VideoSource[], result:any) => scope.filter(v=>!result.items.some((x:any)=>x.status!=='failed' && x.project_id===v.project_id && x.group_id===v.group_id));
+async function createBatch(scope:VideoSource[], form:any, voiceSource:string) {
+  if(creation.pending)return;
+  const signature=JSON.stringify([scope,form,voiceSource]);
+  const request=saved?.request?.signature===signature?saved.request:{signature,id:crypto.randomUUID()};
+  saved={...saved,request};
+  publishCreation({pending:true,scope});
+  try {
+    const result=await api('workbench_video_create_batch',scope,form,voiceSource,request.id);
+    // A fresh overview handoff while this runs is a new selection, even if IDs match.
+    if(saved?.selection===scope)saved={...saved,selection:remainingSources(scope,result)};
+    saved={...saved,request:null};
+    publishCreation({pending:false,scope,result});
+  } catch(error) {
+    publishCreation({pending:false,scope,error:`创建结果未确认：${String(error)}。保持范围和参数不变再次点击，会核对同一请求，不会重复创建。`});
+  }
+}
+
 export function selectVideoSources(selection:VideoSource[]) {saved={...saved,pid:selection[0]?.project_id || '',selection};}
 export function selectVideoSource(pid:string, gids:string[]) {selectVideoSources(gids.map(group_id=>({project_id:pid,group_id})));}
 
@@ -32,15 +56,16 @@ export function VideoStudio({initialProjectId,initialGroupIds,onOpenTasks}: any)
   const [sources,setSources] = useState<any[]>([]), [models,setModels] = useState<any[]>([]);
   const [pid,setPid] = useState(saved?.pid || initialProjectId || '');
   const [selection,setSelection] = useState<VideoSource[]>(saved?.selection || (initialGroupIds || []).map((group_id:string)=>({project_id:initialProjectId,group_id})));
-  const [receipt,setReceipt] = useState(''), [approvedSelection,setApprovedSelection] = useState<string[]>([]);
+  const [approvedSelection,setApprovedSelection] = useState<string[]>([]);
+  const creationState=useSyncExternalStore(subscribeCreation,creationSnapshot);
+  const adding=creationState.pending;
   const [approval,setApproval] = useState<any[] | null>(null);
-  const request = useRef<{signature:string; id:string} | null>(saved?.request || null);
   const [form,setForm] = useState<any>(saved?.form || null), [preset,setPreset] = useState<any>(null);
   const [voiceSource,setVoiceSource] = useState(saved?.voiceSource || 'baseline');
   const [rows,setRows] = useState<any[]>([]), [error,setError] = useState(''), [modelError,setModelError] = useState('');
   const [presetError,setPresetError] = useState(''), [sourceError,setSourceError] = useState(''), [jobsError,setJobsError] = useState('');
   const [sourcesLoading,setSourcesLoading] = useState(true), [jobsLoaded,setJobsLoaded] = useState(false);
-  const [adding,setAdding] = useState(false), [pending,setPending] = useState<Record<string,boolean>>({});
+  const [pending,setPending] = useState<Record<string,boolean>>({});
   const editor = useRef<HTMLTextAreaElement>(null);
   const refresh = () => api('workbench_video_jobs').then(v=>{setRows(v);setJobsLoaded(true);setJobsError('');}).catch(e=>setJobsError(String(e)));
   const loadSources = () => {
@@ -58,6 +83,15 @@ export function VideoStudio({initialProjectId,initialGroupIds,onOpenTasks}: any)
     const timer = setInterval(refresh,2500); return()=>clearInterval(timer);
   },[]);
   useEffect(()=> {saved={...saved,pid,selection,form,voiceSource};},[pid,selection,form,voiceSource]);
+  useEffect(()=> {
+    if(creationState.result) {
+      setSelection(all=>all===creationState.scope?remainingSources(all,creationState.result):all);
+      refresh();
+    }
+  },[creationState]);
+  const created=creationState.result?.items.filter((v:any)=>v.status==='created') || [];
+  const failed=creationState.result?.items.filter((v:any)=>v.status!=='created') || [];
+  const receipt=creationState.result?`已创建 ${created.length} 组、${created.reduce((n:number,v:any)=>n+v.job_ids.length,0)} 条任务；未完成 ${failed.length} 组。请在下方核对费用，尚未提交付费生成。`:'';
   const groups = sources.find(p=>p.id===pid)?.groups || [];
   const gids = selection.filter(v=>v.project_id===pid).map(v=>v.group_id);
   const validSelection = selection.length>0 && selection.some(v=>sources.find(p=>p.id===v.project_id)?.groups.some((g:any)=>g.id===v.group_id && !g.needs_review));
@@ -88,6 +122,8 @@ export function VideoStudio({initialProjectId,initialGroupIds,onOpenTasks}: any)
     <div className="section-heading"><span className="muted">提交进度和历史视频统一在“我的任务”查看</span><Button variant="outline" onClick={onOpenTasks}>查看我的任务</Button></div>
     <p className="notice subtle">素材来自图片组，生成任务独立保存。逐条确认费用，其他任务和项目分析不会阻塞这里。分段完成后自动合并原片，后期另行开始。</p>
     {error && <p className="notice error" role="alert">{error}</p>}
+    {creationState.error && <p className="notice error" role="alert">{creationState.error}</p>}
+    {!!failed.length && <p className="notice error" role="alert">{failed.map((v:any)=>`${scopeLabel(v)}：${v.message}`).join('；')}</p>}
     {presetError && <div className="notice error" role="alert">生成配置加载失败：{presetError}<Button variant="outline" onClick={loadPreset}>重试生成配置</Button></div>}
     <Card><CardContent>
       <div className="section-heading"><h2>新建视频</h2><Badge variant="secondary">全能参考 · 图片 + 音色</Badge></div>
@@ -133,24 +169,7 @@ export function VideoStudio({initialProjectId,initialGroupIds,onOpenTasks}: any)
         <label><input type="checkbox" checked={!!form.aigc_watermark} onChange={e=>update({aigc_watermark:e.target.checked})}/> AIGC 水印</label>
         <label>平台 Skill ID（可留空）<Input value={form.skill_id || ''} disabled={!form.use_context_ir} onChange={e=>update({skill_id:e.target.value})}/></label>
       </details>}
-      <Button style={{marginTop:20}} disabled={adding || sourcesLoading || !!sourceError || !validSelection || !capability} onClick={async()=>{
-        setAdding(true);setError('');setReceipt('');
-        const signature=JSON.stringify([selection,form,voiceSource]);
-        if(request.current?.signature!==signature)request.current={signature,id:crypto.randomUUID()};
-        saved={...saved,request:request.current};
-        try {
-          const result=await api('workbench_video_create_batch',selection,form,voiceSource,request.current!.id);
-          const created=result.items.filter((v:any)=>v.status==='created'), failed=result.items.filter((v:any)=>v.status!=='created');
-          setReceipt(`已创建 ${created.length} 组、${created.reduce((n:number,v:any)=>n+v.job_ids.length,0)} 条任务；未完成 ${failed.length} 组。请在下方核对费用，尚未提交付费生成。`);
-          if(failed.length)setError(failed.map((v:any)=>`${scopeLabel(v)}：${v.message}`).join('；'));
-          const handled=result.items.filter((v:any)=>v.status!=='failed');
-          const remaining=(all:VideoSource[])=>all.filter(v=>!handled.some((x:any)=>x.project_id===v.project_id && x.group_id===v.group_id));
-          setSelection(remaining);
-          if(JSON.stringify(saved?.selection)===JSON.stringify(selection))saved={...saved,selection:remaining(selection),request:null};
-          request.current=null;
-          await refresh();
-        } catch(e){setError(`创建结果未确认：${String(e)}。再次点击会核对同一请求，不会重复创建。`);} finally{setAdding(false);}
-      }}>{adding?'保存素材副本…':'添加生成任务并报价'}</Button>
+      <Button style={{marginTop:20}} disabled={adding || sourcesLoading || !!sourceError || !validSelection || !capability} onClick={()=>{setError('');void createBatch(selection,form,voiceSource);}}>{adding?'保存素材副本…':'添加生成任务并报价'}</Button>
       {receipt && <p className="notice" role="status">{receipt}</p>}
     </CardContent></Card>
     <div className="section-heading" style={{marginTop:24}}><h2>逐条任务记录 · {rows.length}</h2><Button variant="outline" onClick={()=>refresh().catch(e=>setError(String(e)))}>刷新记录</Button></div>

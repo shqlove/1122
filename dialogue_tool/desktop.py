@@ -71,6 +71,7 @@ class DesktopAPI(WorkbenchMixin):
         self._h3_lock = threading.RLock()
         self._h3_state = {}
         self._h3_verified_key = None
+        self._migrate_media_trash()
         self._video_jobs()
 
     def get_state(self):

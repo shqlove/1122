@@ -131,7 +131,7 @@ class BatchWorkbenchMixin:
                     if not g or any(source.get(k) != g.get(k) for k in ('frame_a', 'frame_b')):
                         raise ValueError('图片组已变化，请刷新后重新检查')
                     if action in ('trash', 'restore'):
-                        with _batch_lock:
+                        with _batch_lock, workflow_lock(self._service.projects.root):
                             data = trash_records(self._service)
                             key = group_key(p['id'], g['id'])
                             if action == 'trash': data[key] = {'at': time.time()}
@@ -151,6 +151,7 @@ class BatchWorkbenchMixin:
 
     def workbench_media_batch(self, item_ids, action):
         from .workbench import save_json
+        from .project_run import workflow_lock
         if not isinstance(item_ids, list) or not item_ids or len(item_ids) > 500 or action not in ('trash', 'restore', 'accept', 'unaccept'):
             raise ValueError('请选择有效的视频和操作')
         known = {i['id']: i for i in self.workbench_library()['items']}
@@ -165,7 +166,7 @@ class BatchWorkbenchMixin:
                 else:
                     if item['status'] in ('running', 'submitted', 'submitting', 'tracking'):
                         raise ValueError('视频正在处理，请等待完成')
-                    with _batch_lock:
+                    with _batch_lock, workflow_lock(self._service.projects.root):
                         data = trash_records(self._service)
                         if action == 'trash': data['media:' + key] = {'at': time.time()}
                         else: data.pop('media:' + key, None)

@@ -390,3 +390,13 @@ def test_global_agent_post_scope_checks_exact_video_versions(project, monkeypatc
     with pytest.raises(ValueError, match='视频范围'):
         agent._tool(pid,params,scope)
     assert len(calls)==1
+
+
+@pytest.mark.parametrize('action', ['request_generation_channel', 'refresh_results', 'download_results', 'export_images'])
+def test_global_scope_cannot_run_unscoped_project_actions(project, monkeypatch, action):
+    service, pid = project
+    agent = AgentManager(service)
+    monkeypatch.setattr(agent.workflow, 'execute', lambda *args: pytest.fail('must not modify entire project'))
+    with pytest.raises(ValueError, match='独立视频任务'):
+        agent._tool(pid, {'tool': 'workbench_' + action, 'callId': 'scope-test',
+                         'arguments': {'project_id': pid}}, {pid: ['first']})

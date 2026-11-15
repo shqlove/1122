@@ -307,3 +307,47 @@ def test_partial_creation_failure_is_not_offered_for_automatic_retry(queue, monk
     assert len(result['items'][0]['job_ids']) == 1
     assert host.workbench_video_create_batch(scope, config(), 'baseline', 'partial-creation-0001') == result
     assert len(q.service.projects.list()) == 1
+
+
+@pytest.mark.parametrize('bad', ['trashed', 'missing'])
+def test_removed_group_does_not_block_valid_agent_batch(queue, bad):
+    from dialogue_tool.workbench import save_json
+    q, p = queue
+    save_json(q.source.projects.root / 'workbench-trash.json', {f"group:{p['id']}:trashed": {}})
+    result = q.create(p['id'], [bad, 'g'], config())
+    assert len(result['errors']) == 1 and result['errors'][0]['group_id'] == bad
+    assert len(result['job_ids']) == 1
+    assert q.service.projects.get(result['job_ids'][0])['video_job']['source_group_id'] == 'g'
+
+
+def test_missing_job_does_not_leave_queue_busy(queue, monkeypatch):
+    q, _ = queue
+    monkeypatch.setattr(q, '_start', VideoQueue._start.__get__(q))
+    with pytest.raises((ValueError, KeyError, FileNotFoundError)):
+        q._start('missing', lambda: None)
+    assert not q.active and not q.waiting
+
+
+def test_status_write_failure_does_not_kill_workers(queue, monkeypatch):
+    q, p = queue
+    jobs = [q.create(p['id'], ['g'], config())['job_ids'][0] for _ in range(5)]
+    monkeypatch.setattr(q, '_start', VideoQueue._start.__get__(q))
+    def fail(*args): raise OSError('simulated disk unavailable')
+    monkeypatch.setattr(q, '_save_state', fail)
+    for jid in jobs[:4]:
+        q._start(jid, fail)
+        q.lanes['prepare'].join()
+    progressed = threading.Event()
+    q._start(jobs[4], progressed.set)
+    assert progressed.wait(2), 'A failed status write exhausted the worker pool'
+
+    failed_rows = [r for r in q.rows() if r['id'] in jobs[:4]]
+    assert all(r['phase'] == 'attention' and '保存失败' in r['error'] and not r['busy'] for r in failed_rows)
+    recovered = threading.Event()
+    monkeypatch.setattr(q, '_save_state', VideoQueue._save_state.__get__(q))
+    def prepare(jid):
+        q._save_state(jid, 'needs_review')
+        recovered.set()
+    monkeypatch.setattr(q, '_prepare', prepare)
+    assert q.refresh(jobs[0]) and recovered.wait(2)
+    assert jobs[0] not in q.runtime_errors

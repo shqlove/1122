@@ -46,7 +46,34 @@ def save_json(path, value):
 from .batch_workbench import BatchWorkbenchMixin, trash_records, group_key
 
 
+def media_identity(kind, project_id, group_id, record, fallback):
+    # Round indices move when a current round is archived; identities must not.
+    identity = record.get('submit_id') or record.get('task_id') or record.get('output')
+    if not identity:
+        return fallback
+    digest = hashlib.sha256(str(identity).encode()).hexdigest()[:32]
+    return f"{kind}:{project_id}:{digest}:{group_id or ''}"
+
+
 class WorkbenchMixin(BatchWorkbenchMixin):
+    def _migrate_media_trash(self):
+        # Run on application startup, never from the read-only library/task view.
+        from .project_run import workflow_lock
+        from .batch_workbench import _batch_lock
+        with _batch_lock, workflow_lock(self._service.projects.root):
+            records = trash_records(self._service)
+            if not any(key.startswith(('media:generation:', 'media:assembly:')) for key in records):
+                return
+            changed = False
+            for item in self.workbench_library()['items']:
+                old = 'media:' + item.get('legacy_id', item['id'])
+                new = 'media:' + item['id']
+                if old != new and old in records:
+                    records.setdefault(new, records.pop(old))
+                    changed = True
+            if changed:
+                save_json(self._service.projects.root / 'workbench-trash.json', records)
+
     def _video_jobs(self):
         from .video_queue import queue_for
         with self.lock:
@@ -202,14 +229,14 @@ class WorkbenchMixin(BatchWorkbenchMixin):
                 plans = assembly_plans(cfg)
                 def assembly_key(plan):
                     suffix = ':' + plan['source_group_id'] if plan in cfg.get('dialogue_plans', {}).values() else ''
-                    return f"assembly:{p['id']}:{idx}{suffix}"
+                    return media_identity("assembly", p["id"], plan.get("source_group_id"), plan.get("assembly", {}), f"assembly:{p['id']}:{idx}{suffix}")
                 assembled_groups = {part['group_id']: assembly_key(plan) for plan in plans
                     if plan.get('assembly', {}).get('output') and Path(plan['assembly']['output']).is_file()
                     for part in plan.get('parts', [])}
                 for gid, task in cfg.get('tasks', {}).items():
-                    key = f"generation:{p['id']}:{idx}:{gid}"
+                    key = media_identity("generation", p["id"], gid, task, f"generation:{p['id']}:{idx}:{gid}")
                     params = task.get('request_snapshot', {}).get('parameters', cfg)
-                    item = {'id': key, 'kind': 'generation', 'project_id': p['id'], 'project_name': p['name'],
+                    item = {'id': key, 'legacy_id': f"generation:{p['id']}:{idx}:{gid}", 'kind': 'generation', 'project_id': p['id'], 'project_name': p['name'],
                             'group_id': task.get('source_group_id') or gid, 'task_group_id': gid,
                             'group_number': groups.get(task.get('source_group_id') or gid, 0), 'round': idx,
                             'segment': task.get('segment'),
@@ -232,7 +259,7 @@ class WorkbenchMixin(BatchWorkbenchMixin):
                     assembly = plan.get('assembly', {})
                     if not assembly.get('output'):
                         continue
-                    item = {'id': assembly_key(plan), 'kind': 'assembly',
+                    item = {'id': assembly_key(plan), 'legacy_id': f"assembly:{p['id']}:{idx}" + (':' + plan['source_group_id'] if plan in cfg.get('dialogue_plans', {}).values() else ''), 'kind': 'assembly',
                             'project_id': p['id'], 'project_name': p['name'], 'round': idx,
                             'group_id': plan.get('source_group_id'),
                             'group_ids': ([plan['source_group_id']] if plan in cfg.get('dialogue_plans', {}).values()

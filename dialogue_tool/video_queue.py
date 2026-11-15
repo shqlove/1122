@@ -1,5 +1,6 @@
 """Independent video jobs: immutable inputs, one quote and submission identity per clip."""
 import copy
+import logging
 import queue
 import shutil
 import threading
@@ -38,6 +39,7 @@ class VideoQueue:
         self.lock = threading.RLock()
         self.active = set()
         self.waiting = set()
+        self.runtime_errors = {}
         self.lanes = {}
         self.stop = threading.Event()
         self.assembly_lock = threading.Lock()
@@ -46,14 +48,15 @@ class VideoQueue:
         p = self.service.projects.get(jid)
         p['queue_state'] = {'phase': phase, 'error': error, 'updated_at': time.time()}
         self.service.projects.save(p)
+        self.runtime_errors.pop(jid, None)
 
     def _start(self, jid, operation):
         with self.lock:
             if jid in self.active:
                 return False
+            job = self.service.projects.get(jid)
             self.active.add(jid)
             self.waiting.add(jid)
-            job = self.service.projects.get(jid)
             phase = job.get('queue_state', {}).get('phase')
             lane = 'tracking' if phase in ('submitting', 'tracking') or any(t.get('submit_id') for t in job.get('generation', {}).get('tasks', {}).values()) else 'prepare'
             if lane not in self.lanes:
@@ -63,6 +66,9 @@ class VideoQueue:
                         try: task = pending.get(timeout=.2)
                         except queue.Empty: continue
                         try: task()
+                        except Exception:
+                            # A failed status write must not permanently remove a worker.
+                            logging.getLogger(__name__).exception('Video worker could not record task failure')
                         finally: pending.task_done()
                 for _ in range(8 if lane == 'tracking' else 4):
                     threading.Thread(target=worker, daemon=True).start()
@@ -73,7 +79,11 @@ class VideoQueue:
                 if not self.stop.is_set():
                     operation()
             except Exception as exc:
-                self._save_state(jid, 'attention', str(exc))
+                try:
+                    self._save_state(jid, 'attention', str(exc))
+                except Exception as save_error:
+                    self.runtime_errors[jid] = f'{exc}；错误状态保存失败：{save_error}'
+                    raise
             finally:
                 with self.lock:
                     self.active.discard(jid)
@@ -111,11 +121,9 @@ class VideoQueue:
             raise ValueError('成功模板使用原始参考音色，请先切换手动配置')
         from .batch_workbench import trash_records, group_key
         trash = trash_records(self.source)
-        if any(group_key(source_id, gid) in trash for gid in group_ids):
-            raise ValueError('图片组已移入回收站，请先恢复')
         source = self.source.projects.get(source_id)
         groups = {g['id']: g for g in source['groups']}
-        if not group_ids or len(set(group_ids)) != len(group_ids) or not set(group_ids).issubset(groups):
+        if not group_ids or len(set(group_ids)) != len(group_ids):
             raise ValueError('请选择有效的来源图片组')
         if len(group_ids) > 1:
             result = {'job_ids': [], 'batch_ids': [], 'errors': []}
@@ -127,6 +135,10 @@ class VideoQueue:
                 except Exception as exc:
                     result['errors'].append({'group_id': gid, 'message': str(exc)})
             return result
+        if group_key(source_id, group_ids[0]) in trash:
+            raise ValueError('图片组已移入回收站，请先恢复')
+        if group_ids[0] not in groups:
+            raise ValueError('请选择有效的来源图片组')
         batch_id = uuid.uuid4().hex
         batch_folder = self.service.projects.root / batch_id
         batch_folder.mkdir()
@@ -256,7 +268,7 @@ class VideoQueue:
         tasks = p.get('generation', {}).get('tasks', {})
         if any(t.get('submit_id') for t in tasks.values()):
             return self._start(jid, lambda: self._watch(jid))
-        if p['queue_state']['phase'] in ('attention', 'awaiting_approval'):
+        if jid in self.runtime_errors or p['queue_state']['phase'] in ('attention', 'awaiting_approval'):
             return self._start(jid, lambda: self._prepare(jid))
         return False
 
@@ -328,7 +340,8 @@ class VideoQueue:
             cfg = p['generation']
             task = next(iter(cfg.get('tasks', {}).values()), {})
             params = task.get('request_snapshot', {}).get('parameters', cfg)
-            rows.append({'id': p['id'], **p['video_job'], **p['queue_state'], 'created_at': cfg.get('submitted_at') or p['created_at'],
+            state = {'phase': 'attention', 'error': self.runtime_errors[p['id']]} if p['id'] in self.runtime_errors else p['queue_state']
+            rows.append({'id': p['id'], **p['video_job'], **state, 'created_at': cfg.get('submitted_at') or p['created_at'],
                 'model': params['model'], 'duration': params['duration'], 'resolution': params['resolution'], 'ratio': params['ratio'],
                 'prompt': task.get('request_snapshot', {}).get('bound_prompt') or cfg['global_prompt'],
                 'role_bindings': task.get('request_snapshot', {}).get('role_bindings', task.get('references', [])),

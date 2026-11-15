@@ -168,7 +168,7 @@ def test_history_reference_refuses_changed_file(wb):
     api._service.projects.save(p)
     source.write_bytes(b'changed')
     with pytest.raises(ValueError, match='变化'):
-        api.workbench_history_reference(f"generation:{p['id']}:-1:g1", sha)
+        api.workbench_history_reference(next(i["id"] for i in api.workbench_library()["items"] if i["kind"] == "generation"), sha)
 
 
 def test_assembly_post_archives_verified_source_only(wb, monkeypatch):
@@ -180,7 +180,7 @@ def test_assembly_post_archives_verified_source_only(wb, monkeypatch):
         'output': str(assembled), 'sha256': checksum, 'duration': 30}}
     api._service.projects.save(p)
     monkeypatch.setattr('dialogue_tool.workbench.subprocess.Popen', lambda *a, **kw: None)
-    key = f"assembly:{p['id']}:-1"
+    key = next(i["id"] for i in api.workbench_library()["items"] if i["kind"] == "assembly")
     result = api.workbench_start_post([key])
     request = read_json(root / 'workbench-runs' / result['id'] / 'request.json')
     selected = request['items'][0]
@@ -212,7 +212,7 @@ def test_post_exact_selection_snapshot_and_restart(wb, monkeypatch):
     api, p, root, source, _ = wb
     calls = []
     monkeypatch.setattr('dialogue_tool.workbench.subprocess.Popen', lambda *a, **k: calls.append((a, k)))
-    key = f"generation:{p['id']}:-1:g1"
+    key = next(i["id"] for i in api.workbench_library()["items"] if i["kind"] == "generation")
     state = api.workbench_start_post([key])
     folder = root / 'workbench-runs' / state['id']
     request = read_json(folder / 'request.json')
@@ -234,7 +234,7 @@ def test_reject_unknown_and_unarchived_paths(wb, monkeypatch):
     monkeypatch.setattr('dialogue_tool.workbench.subprocess.Popen', lambda *a, **k: pytest.fail('must not spawn'))
     with pytest.raises(ValueError):
         api.workbench_start_post(['not-an-item'])
-    key = f"generation:{p['id']}:-1:g1"
+    key = next(i["id"] for i in api.workbench_library()["items"] if i["kind"] == "generation")
     with pytest.raises(ValueError):
         api.workbench_start_post([key, key])
     p['generation']['tasks']['g1']['archive_output'] = None
@@ -290,7 +290,7 @@ def test_agent_cannot_post_outside_selected_group(wb):
     api, p, _, _, _ = wb
     with pytest.raises(ValueError, match='范围'):
         api._agent._tool(p['id'], {'tool': 'workbench_start_postproduction', 'arguments': {
-            'item_ids': [f"generation:{p['id']}:-1:g1"], 'recognize': True}, 'callId': 'test'}, [])
+            'item_ids': [next(i["id"] for i in api.workbench_library()["items"] if i["kind"] == "generation")], 'recognize': True}, 'callId': 'test'}, [])
 
 
 def test_agent_assembly_checks_all_actual_parts_not_original_source_group(wb, monkeypatch):
@@ -301,7 +301,7 @@ def test_agent_assembly_checks_all_actual_parts_not_original_source_group(wb, mo
     api._service.projects.save(p)
     calls = []
     monkeypatch.setattr(api._agent.workflow, 'execute', lambda *args: calls.append(args) or {'id': 'test-run'})
-    params = {'tool': 'workbench_start_postproduction', 'arguments': {'item_ids': [f"assembly:{p['id']}:-1"], 'recognize': True}, 'callId': 'assembly-test'}
+    params = {'tool': 'workbench_start_postproduction', 'arguments': {'item_ids': [next(i["id"] for i in api.workbench_library()["items"] if i["kind"] == "assembly")], 'recognize': True}, 'callId': 'assembly-test'}
     with pytest.raises(ValueError, match='范围'):
         api._agent._tool(p['id'], params, ['g1'])
     assert not calls
@@ -455,3 +455,35 @@ def test_batch_export_checks_content_and_never_overwrites(wb, tmp_path, monkeypa
     assert not api.workbench_export_selected([item['id']])[0]['ok']
     assert target.read_bytes() == b'user modified export'
     assert not list(destination.glob('*.tmp'))
+
+
+def test_recycled_video_keeps_identity_after_new_round(wb):
+    import copy
+    api, p, _, source, _ = wb
+    before = next(i for i in api.workbench_library()['items'] if i['kind'] == 'generation')
+    assert api.workbench_media_batch([before['id']], 'trash')[0]['ok']
+    p['generation_history'] = [copy.deepcopy(p['generation'])]
+    next_clip = source.with_name('next.mp4'); next_clip.write_bytes(b'new round')
+    p['generation']['tasks']['g1'].update(output=str(next_clip), archive_output=str(next_clip))
+    api._service.projects.save(p)
+    rows = [i for i in api.workbench_library()['items'] if i['kind'] == 'generation']
+    old = next(i for i in rows if i['round'] == 0)
+    new = next(i for i in rows if i['round'] == -1)
+    assert old['id'] == before['id'] and old['trashed']
+    assert new['id'] != old['id'] and not new['trashed']
+    assert api.workbench_media_batch([old['id']], 'restore')[0]['ok']
+    assert not api._library_item(old['id'])['trashed']
+
+
+def test_legacy_recycle_mark_migrates_on_startup(wb):
+    api, p, _, _, _ = wb
+    legacy = f"media:generation:{p['id']}:-1:g1"
+    save_json(api._service.projects.root / 'workbench-trash.json', {legacy: {'at': 123}})
+    restarted = DesktopAPI(api._service)
+    try:
+        item = next(i for i in restarted.workbench_library()['items'] if i['kind'] == 'generation')
+        assert item['trashed']
+        records = read_json(api._service.projects.root / 'workbench-trash.json')
+        assert legacy not in records and records['media:' + item['id']] == {'at': 123}
+    finally:
+        restarted.close()

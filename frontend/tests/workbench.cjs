@@ -107,6 +107,7 @@ const assert = require("node:assert/strict");
               if (name === "workbench_video_models") return [{model:'seedance_2.5',label:'即梦 2.5',min:4,max:30,ratios:['16:9','4:3'],resolutions:['720p','1080p','4k']}];
               if (name === "workbench_video_jobs") return window.__videoJobs || [];
               if (name === "workbench_video_create_batch") {
+                if(window.__holdCreation)await new Promise(resolve=>{window.__releaseCreation=resolve;});
                 const scope=args[0],config=args[1],requestId=args[3];
                 window.__batchReceipts ||= {};
                 if(window.__batchReceipts[requestId])return window.__batchReceipts[requestId];
@@ -567,6 +568,33 @@ const assert = require("node:assert/strict");
   assert.equal(batchCall[2].use_context_ir,true);
   assert.equal(await page.getByRole('button',{name:'添加生成任务并报价',exact:true}).isEnabled(),false);
   assert.equal(await page.evaluate(n=>window.__calls.slice(n).filter(c=>['select_project','workbench_video_approve','workbench_video_approve_batch','workbench_start_post'].includes(c[0])).length,batchBefore),0);
+  // A pending creation survives unmount/remount and cannot be submitted twice.
+  await page.getByRole('button',{name:'图片组总览',exact:true}).click();
+  await page.getByRole('button',{name:'生成所选 2 组视频',exact:true}).click();
+  await page.evaluate(()=>{window.__holdCreation=true;});
+  const pendingBefore=await page.evaluate(()=>window.__calls.filter(c=>c[0]==='workbench_video_create_batch').length);
+  await page.getByRole('button',{name:'添加生成任务并报价',exact:true}).click();
+  await page.waitForFunction(()=>!!window.__releaseCreation);
+  await page.getByRole('button',{name:'我的任务',exact:true}).click();
+  await page.getByRole('button',{name:'视频生成',exact:true}).click();
+  assert.equal(await page.getByRole('button',{name:'保存素材副本…',exact:true}).isEnabled(),false);
+  await page.evaluate(()=>{window.__holdCreation=false;window.__releaseCreation();delete window.__releaseCreation;});
+  await page.getByText('本次生成：0 组 · 0 个来源',{exact:true}).waitFor();
+  assert.equal(await page.evaluate(()=>window.__calls.filter(c=>c[0]==='workbench_video_create_batch').length),pendingBefore+1);
+  await page.getByRole('button',{name:'我的任务',exact:true}).click();
+  await page.getByRole('button',{name:'视频生成',exact:true}).click();
+  await page.getByText('本次生成：0 组 · 0 个来源',{exact:true}).waitFor();
+  // A new handoff during creation must be preserved even when IDs are identical.
+  await page.getByRole('button',{name:'图片组总览',exact:true}).click();
+  await page.getByRole('button',{name:'生成所选 2 组视频',exact:true}).click();
+  await page.evaluate(()=>{window.__holdCreation=true;});
+  await page.getByRole('button',{name:'添加生成任务并报价',exact:true}).click();
+  await page.waitForFunction(()=>!!window.__releaseCreation);
+  await page.getByRole('button',{name:'图片组总览',exact:true}).click();
+  await page.getByRole('button',{name:'生成所选 2 组视频',exact:true}).click();
+  await page.evaluate(()=>{window.__holdCreation=false;window.__releaseCreation();delete window.__releaseCreation;});
+  await page.getByRole('button',{name:'添加生成任务并报价',exact:true}).waitFor();
+  await page.getByText('本次生成：2 组 · 2 个来源',{exact:true}).waitFor();
   // Partial failure retains only the failed source for an explicit retry.
   await page.getByRole('button',{name:'图片组总览',exact:true}).click();
   await page.getByRole('button',{name:'生成所选 2 组视频',exact:true}).click();

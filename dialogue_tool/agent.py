@@ -284,7 +284,7 @@ class AgentManager:
             if target_project not in scope:
                 raise ValueError('请选择本轮 allowed_scopes 中的 project_id')
             pid, scope = target_project, scope[target_project]
-            if action in ('analyze_video', 'configure_generation', 'apply_h3_baseline', 'new_round', 'prepare_batch', 'quote_batch', 'request_submission'):
+            if action in ('analyze_video', 'configure_generation', 'apply_h3_baseline', 'new_round', 'prepare_batch', 'quote_batch', 'request_submission', 'request_generation_channel', 'refresh_results', 'download_results', 'export_images'):
                 raise ValueError('总览范围请使用独立视频任务；项目整体操作请进入导入与拆解')
         elif target_project and target_project != pid:
             raise ValueError('操作超出聊天选定项目')
