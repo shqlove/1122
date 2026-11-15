@@ -351,3 +351,16 @@ def test_status_write_failure_does_not_kill_workers(queue, monkeypatch):
     monkeypatch.setattr(q, '_prepare', prepare)
     assert q.refresh(jobs[0]) and recovered.wait(2)
     assert jobs[0] not in q.runtime_errors
+
+
+def test_partial_split_creation_cannot_publish_incomplete_assembly(queue, monkeypatch):
+    q, p = queue
+    c = {k: v for k, v in BASELINE['parameters'].items() if k != 'mode'}
+    c.update(common_prompt=BASELINE['global_prompt'], baseline_id=BASELINE['id'], auto_split_dialogue=True)
+    batch = q.create(p['id'], ['g'], c)
+    first = q.service.projects.get(batch['job_ids'][0])
+    assert first['video_job']['part_count'] == 2
+    monkeypatch.setattr(q.service.projects, 'list', lambda: [first])
+    monkeypatch.setattr('dialogue_tool.segment_assembly.assemble_segments', lambda *args: pytest.fail('must not publish missing segment'))
+    with pytest.raises(ValueError, match='分段任务记录不完整'):
+        q._assemble(batch['batch_id'])

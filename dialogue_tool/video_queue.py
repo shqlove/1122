@@ -311,6 +311,8 @@ class VideoQueue:
                 parent['generation']['tasks'][job['id']] = task
                 gid = meta['source_group_id']
                 parts = sorted([p for p in jobs if p['video_job']['source_group_id']==gid], key=lambda p:p['video_job']['part'])
+                if [p['video_job']['part'] for p in parts] != list(range(1, meta['part_count'] + 1)) or any(p['video_job']['part_count'] != meta['part_count'] for p in parts):
+                    raise ValueError('分段任务记录不完整，请核对本组任务；不会把缺段视频标记为完整原片')
                 plan = parent['generation']['dialogue_plans'].setdefault(gid, {'source_group_id': gid, 'assembly': {}})
                 plan['parts'] = [{'group_id':p['id'], 'index':p['video_job']['part']} for p in parts]
                 plan['assembly']['order'] = [p['id'] for p in parts]
