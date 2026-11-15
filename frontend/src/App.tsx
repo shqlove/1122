@@ -292,7 +292,7 @@ export default function App() {
     try {
       const r = await fn();
       await refresh(true);
-      if (success) setNotice(success);
+      if (success && r !== false) setNotice(success);
       return r;
     } catch (e: any) {
       setNotice(e.message || String(e));
@@ -581,14 +581,10 @@ function Overview() {
     await act(async () => {
       await api("workbench_select_global_groups", pid, ids);
       await api("select_project", pid);
-      if (clean) {
-        await api("agent_send", "请只处理本次指定的图片组：逐图检查，去除水印和叠加字幕，修复后复看并记录检查结果。没有水印字幕的图片跳过。不要生成视频，不修改提示词或音色。", agent.model || "", agent.effort || "low", ids, pid);
-        setPanel(true);
-      } else {
-        await api("workbench_enter_generation", pid, ids);
-      }
+      await api("agent_send", "请只处理本次指定的图片组：逐图检查，去除水印和叠加字幕，修复后复看并记录检查结果。没有水印字幕的图片跳过。不要生成视频，不修改提示词或音色。", agent.model || "", agent.effort || "low", ids, pid);
+      setPanel(true);
       return true;
-    }).then(async (ok: any) => { if (ok) await goSource({project_id: pid}, clean ? "groups" : "generate"); });
+    }).then(async (ok: any) => { if (ok) await goSource({project_id: pid}, "groups"); });
   };
   const list = view.tab === "groups" ? filteredGroups : filteredVideos;
   return <>
@@ -621,7 +617,7 @@ function Overview() {
         <Button variant="ghost" disabled={!view.picked.length} onClick={() => change({picked: []})}>清空选择</Button>
         <span>已选 {pickedGroups.length} 组 · 跨 {queueProjects.length} 个项目</span>
       </div>
-      {!!queueProjects.length && <Card className="overview-queue"><CardContent><h3>所选图片组 · 按来源项目处理</h3><p className="muted">跨集选择保留在总览中。各项目沿用自己的配置，生成前分别核对费用。</p>
+      {!!queueProjects.length && <Card className="overview-queue"><CardContent><h3>所选图片组 · 按来源项目处理</h3><p className="muted">跨集选择保留在总览中。进入独立视频生成页选择模板与参数，每条任务分别核对费用。</p>
         {queueProjects.map(pid => <div className="overview-queue-row" key={pid}>
           <span>{pickedGroups.find((g: any) => g.project_id === pid).project_name}<small>{pickedGroups.filter((g: any) => g.project_id === pid).map((g: any) => `第${g.group_number}组`).join("、")}</small></span>
           <div className="row wrap"><Button variant="outline" disabled={busy || agent.busy || !agent.connected} onClick={() => prepareScope(pid, true)}>助手清理字幕 / 水印</Button>
@@ -634,7 +630,10 @@ function Overview() {
         <CardContent><div className="row between"><label className="check-label"><input type="checkbox" aria-label={`选择${g.project_name}第${g.group_number}组`} checked={view.picked.includes(g.id)} onChange={e => change({picked: e.target.checked ? [...view.picked, g.id] : view.picked.filter((id: string) => id !== g.id)})} /><strong>第 {String(g.group_number).padStart(2, "0")} 组</strong></label><Badge variant="secondary">{g.generated ? `已生成 ${g.generated} 版` : "尚未生成"}</Badge></div>
           <p className="clamp" title={g.project_name}>{g.project_name}</p><p className="clamp">A：{g.person_a || "待确认"} · B：{g.person_b || "待确认"}</p>
           <div className="row wrap"><Badge variant="outline">{g.clean_reviewed ? "清理检查通过" : g.repaired_a || g.repaired_b ? "已有修复图" : "原图 · 待清理检查"}</Badge>{g.needs_review && <Badge variant="outline">人物待确认</Badge>}</div>
-          <Button variant="ghost" onClick={() => goSource(g)}>查看来源图片组 <ArrowRight size={14} /></Button>
+          <div className="row wrap" style={{marginTop:12}}>
+            <Button onClick={() => startVideo(g.project_id, [g.group_id])}><Clapperboard size={15} />生成视频</Button>
+            <Button variant="ghost" onClick={() => goSource(g)}>查看来源图片组 <ArrowRight size={14} /></Button>
+          </div>
         </CardContent></Card>)}</div>
     </> : <>
       <div className="section-heading wrap"><h2>生成视频 <span>{filteredVideos.length} 条</span></h2><div className="row wrap">
@@ -645,7 +644,7 @@ function Overview() {
     </>}
     {!list.length && view.tab === "groups" && <Empty title="没有符合条件的图片组" body="调整筛选条件，或在项目中完成视频拆解。" />}
     {list.length > view.limit && <Button className="overview-more" variant="outline" onClick={() => change({limit: view.limit + 24})}>加载更多 · 已显示 {view.limit} / {list.length}</Button>}
-    {imageDetail && <Modal title={`${imageDetail.project_name} · 第${imageDetail.group_number}组`} onClose={() => setImageDetail(null)} wide><div className="overview-pair"><GlobalShot item={imageDetail} side="a" /><GlobalShot item={imageDetail} side="b" /></div><Button onClick={() => goSource(imageDetail)}>回到来源图片组</Button></Modal>}
+    {imageDetail && <Modal title={`${imageDetail.project_name} · 第${imageDetail.group_number}组`} onClose={() => setImageDetail(null)} wide><div className="overview-pair"><GlobalShot item={imageDetail} side="a" /><GlobalShot item={imageDetail} side="b" /></div><div className="row wrap"><Button onClick={() => startVideo(imageDetail.project_id, [imageDetail.group_id])}>生成视频</Button><Button variant="outline" onClick={() => goSource(imageDetail)}>回到来源图片组</Button></div></Modal>}
     {detail && <Modal title={`${detail.project_name} · ${detail.label || `第${detail.group_number}组`}`} description="查看该版本实际提交的记录；历史素材缺失时会明确提示。" onClose={() => setDetail(null)} wide>
       <p>{detail.model} · {detail.duration} 秒 · {detail.resolution} · Context-IR {detail.context_ir === true ? "开启" : detail.context_ir === false ? "关闭" : "未记录"}</p>
       {(detail.parts || [detail]).map((part: any, i: number) => <div key={i} className="submission-inputs">
@@ -1837,12 +1836,15 @@ function Post() {
   const [scope, setScope] = useState(postIds.length ? "all" : "project"),
     [showParts, setShowParts] = useState(false),
     [edit, setEdit] = useState<any>(null),
-    [settings, setSettings] = useState<any>(null);
-  useEffect(() => {
+    [settings, setSettings] = useState<any>(null),
+    [settingsError, setSettingsError] = useState("");
+  const loadSettings = () => {
+    setSettingsError("");
     api("workbench_post_settings")
       .then(setSettings)
-      .catch(() => {});
-  }, []);
+      .catch(e => setSettingsError(String(e)));
+  };
+  useEffect(loadSettings, []);
   const items = lib.items.filter(
     (v: any) =>
       (v.kind === "post" ? v.source_path : v.kind === "assembly" ? v.available : v.archive_path) &&
@@ -1853,6 +1855,7 @@ function Post() {
   return (
     <>
       <p className="notice subtle">第二步 · 独立后期：请先检查合并原片。只有点击下方“开始 / 继续后期”，才为选中视频添加字幕、空间效果和 BGM；生成完成或进入本页不会自动执行。</p>
+      {settingsError ? <div className="notice error" role="alert">后期配置加载失败：{settingsError}<Button variant="outline" onClick={loadSettings}>重试后期配置</Button></div> : !settings ? <p className="muted">正在读取后期配置…</p> : !settings.available && <p className="notice">{settings.message || "未找到本机后期处理程序，请在设置中检查环境。"}</p>}
       <div className="post-flow">
         <Card>
           <CardContent>
@@ -1970,7 +1973,7 @@ function Post() {
         </Button>
         <Button
           disabled={
-            working || active || !postIds.length || !settings?.available
+            working || active || !postIds.length || !settings?.available || !!settingsError
           }
           onClick={() =>
             act(
@@ -2082,16 +2085,23 @@ function SettingsPage() {
   const [post, setPost] = useState<any>(null),
     [connection, setConnection] = useState<any>(null),
     [key, setKey] = useState(""),
-    [files, setFiles] = useState<any>({ voices: [] });
-  useEffect(() => {
+    [files, setFiles] = useState<any>({ voices: [] }),
+    [postError, setPostError] = useState(""), [filesError, setFilesError] = useState("");
+  const loadPost = () => {
+    setPostError("");
     api("workbench_post_settings")
       .then(setPost)
-      .catch(() => {});
+      .catch(e => setPostError(String(e)));
+  };
+  const loadFiles = () => {
+    setFilesError(""); setFiles({voices:[]});
     if (p)
       api("agent_files", p.id)
         .then(setFiles)
-        .catch(() => {});
-  }, [p?.id]);
+        .catch(e => setFilesError(String(e)));
+  };
+  useEffect(loadPost, []);
+  useEffect(loadFiles, [p?.id]);
   return (
     <div className="settings-grid">
       <Card>
@@ -2163,6 +2173,7 @@ function SettingsPage() {
       <Card>
         <CardContent>
           <h2>共享音色库</h2>
+          {filesError && <div className="notice error" role="alert">音色库读取失败：{filesError}<Button variant="outline" onClick={loadFiles}>重试音色库</Button></div>}
           <p className="muted">
             音色可绑定到当前项目已选的 {selected.length} 组。
           </p>
@@ -2196,7 +2207,7 @@ function SettingsPage() {
       <Card>
         <CardContent>
           <h2>chuli 后期流程</h2>
-          {post?.available ? (
+          {postError ? <div className="notice error" role="alert">后期配置加载失败：{postError}<Button variant="outline" onClick={loadPost}>重试后期配置</Button></div> : !post ? <p>正在读取后期配置…</p> : post.available ? (
             <>
               <Badge variant="secondary">{post.profile}</Badge>
               <p>阿里云真实字幕 → 本地空间效果 → 统一 BGM → FFmpeg 合成并检查导出</p>

@@ -8,7 +8,7 @@ const assert = require("node:assert/strict");
   fs.mkdirSync(validation, {recursive:true});
   const script = fs.readFileSync(path.join(assets, 'workbench.js'), 'utf8').replaceAll('</script', '<\\/script');
   fs.writeFileSync(path.join(validation, 'workbench.html'), '<!doctype html><html lang="zh-CN"><meta charset="UTF-8"><style>'+fs.readFileSync(path.join(assets,'workbench.css'),'utf8')+'</style><div id="root"></div><script type="module">'+script+'</script></html>');
-  const browser = await chromium.launch({ channel: "msedge", headless: true });
+  const browser = await chromium.launch({ ...(process.platform === "win32" ? {channel: "msedge"} : {}), headless: true });
   const page = await browser.newPage({
     viewport: { width: 1560, height: 920 },
   });
@@ -94,6 +94,7 @@ const assert = require("node:assert/strict");
             (_, name) =>
             async (...args) => {
               window.__calls.push([name, ...args]);
+              if (window.__failApi?.[name]) throw new Error(window.__failApi[name]);
               if (name === "workbench_tasks") return {items:[
                 {id:'history-complete',project_id:'p1',project_name:'历史第一集',group_number:1,round:0,segment:{index:1,count:2},model:'MiniMax-H3',provider:'compshare',provider_label:'优云智算 H3',duration:15,ratio:'16:9',resolution:'768P',status:'downloaded',status_label:'已完成',category:'completed',submit_id:'history-id',task_id:'platform-old',created_at:1794748500,prompt:'历史提交的提示词',references:[],available:true,submitted:true},
                 {id:'current-running',project_id:'other',project_name:'另一集',group_number:2,model:'seedance_2.5',provider:'dreamina',provider_label:'即梦',duration:15,status:'running',status_label:'生成中',category:'running',submit_id:'running-id',created_at:1794748600,prompt:'正在处理的提示词',references:[],available:false,submitted:true},
@@ -101,7 +102,7 @@ const assert = require("node:assert/strict");
                 {id:'history-failed',project_id:'p1',project_name:'历史第一集',group_number:3,model:'MiniMax-H3',provider:'compshare',provider_label:'优云智算 H3',duration:15,status:'failed',status_label:'失败',category:'failed',submit_id:'failed-id',created_at:1794748400,prompt:'失败任务原文',error:'平台失败',references:[],available:false,submitted:true}
               ]};
               if (name === "workbench_media") return {url:'data:video/mp4;base64,',path:'test-video.mp4'};
-              if (name === "workbench_video_sources") return [{id:'p1',name:'素材项目',groups:[{id:'g1',number:1,selected:true}]}];
+              if (name === "workbench_video_sources") return [{id:'p1',name:'素材项目',groups:[{id:'g1',number:1,selected:true}]},{id:'other',name:'另一集',groups:[{id:'g1',number:1,selected:true}]}];
               if (name === "workbench_video_preset") return {model:'MiniMax-H3',duration:15,ratio:'16:9',resolution:'768P',prompt_mode:'shared',common_prompt:'原镜头，台词：“原台词”，原声音。',baseline_id:'h3-first-v1',auto_split_dialogue:true,use_context_ir:true,preserve_prompt:true,audio_first:false};
               if (name === "workbench_video_models") return [{model:'seedance_2.5',label:'即梦 2.5',min:4,max:30,ratios:['16:9','4:3'],resolutions:['720p','1080p','4k']}];
               if (name === "workbench_video_jobs") return window.__videoJobs || [];
@@ -224,7 +225,9 @@ const assert = require("node:assert/strict");
                     supportedReasoningEfforts: [{ reasoningEffort: "low" }],
                   },
                 ]; }
-              return true;
+              if (['start_analysis','agent_send'].includes(name)) return true;
+              (window.__unexpectedCalls ||= []).push(name);
+              throw new Error('Unmocked desktop API: ' + name);
             },
         },
       ),
@@ -470,6 +473,61 @@ const assert = require("node:assert/strict");
   await page.screenshot({path:path.join(validation,'aliyun-post-flow.png')});
   assert.deepEqual(errors, []);
   console.log('PASS: generation defaults to assembly, optional source parts, combined output post handoff, Aliyun caption flow');
+  // A global card carries its explicit source into the independent form, even while Agent is busy.
+  await page.getByRole('button', {name:'素材总览 ALL',exact:true}).click();
+  await page.getByRole('tab', {name:'全部图片组',exact:true}).click();
+  const before = await page.evaluate(()=>window.__calls.length);
+  await page.evaluate(()=>{window.__agentBusy=true;});
+  await page.locator('.overview-group').filter({hasText:'另一集'}).getByRole('button',{name:'生成视频',exact:true}).click();
+  await page.getByLabel('提交提示词').waitFor();
+  assert.equal(await page.getByLabel('素材来源',{exact:true}).inputValue(),'other');
+  assert.equal(await page.locator('.video-source input').isChecked(),true);
+  await page.getByRole('button',{name:'添加生成任务并报价',exact:true}).click();
+  const handoff = await page.evaluate(()=>window.__calls.filter(c=>c[0]==='workbench_video_create').at(-1));
+  assert.equal(handoff[1],'other');assert.deepEqual(handoff[2],['g1']);
+  assert.equal(await page.evaluate(n=>window.__calls.slice(n).filter(c=>['select_project','workbench_enter_generation','agent_send','workbench_video_approve'].includes(c[0])).length,before),0);
+  await page.getByRole('button',{name:'素材总览 ALL',exact:true}).click();
+  await page.getByRole('button',{name:'查看第一集第1组',exact:true}).click();
+  await page.getByRole('dialog').getByRole('button',{name:'生成视频',exact:true}).click();
+  await page.getByLabel('提交提示词').waitFor();
+  assert.equal(await page.getByLabel('素材来源',{exact:true}).inputValue(),'p1');
+  console.log('PASS: overview card and detail hand off exact cross-project selection while Agent runs; no implicit submission');
+
+  await page.evaluate(()=>{window.__agentBusy=false;window.__failApi={workbench_video_jobs:'测试状态读取失败',workbench_group_image:'测试图片读取失败',workbench_video_sources:'测试来源读取失败'};});
+  await page.getByRole('button',{name:'刷新记录',exact:true}).click();
+  await page.getByText(/任务状态暂未更新：.*测试状态读取失败/).waitFor();
+  assert.ok(await page.getByText('逐条任务记录', {exact:false}).count());
+  await page.getByRole('button',{name:'刷新素材来源',exact:true}).click();
+  await page.getByText(/素材来源加载失败：.*测试来源读取失败/).waitFor();
+  assert.equal(await page.getByRole('button',{name:'添加生成任务并报价',exact:true}).isEnabled(),false);
+  await page.evaluate(()=>{window.__failApi={workbench_post_settings:'测试后期配置失败'};});
+  await page.getByRole('button',{name:'后期制作 04',exact:true}).click();
+  await page.getByText(/后期配置加载失败：.*测试后期配置失败/).waitFor();
+  assert.equal(await page.getByRole('button',{name:'开始 / 继续后期',exact:true}).isEnabled(),false);
+  await page.evaluate(()=>{window.__failApi={};});
+  await page.getByRole('button',{name:'重试后期配置',exact:true}).click();
+  await page.getByText(/后期配置加载失败/).waitFor({state:'hidden'});
+  assert.deepEqual(await page.evaluate(()=>window.__unexpectedCalls || []),[]);
+
+  // Full reload clears the saved form, exercising the initial configuration failure.
+  await page.reload();
+  await page.getByRole('heading',{name:'项目',exact:true}).waitFor();
+  await page.evaluate(()=>{window.__failApi={workbench_video_preset:'测试配置读取失败'};});
+  await page.getByRole('button',{name:'视频生成 03',exact:true}).click();
+  await page.getByText(/生成配置加载失败：.*测试配置读取失败/).waitFor();
+  await page.evaluate(()=>{window.__failApi={};});
+  await page.getByRole('button',{name:'重试生成配置',exact:true}).click();
+  await page.getByLabel('提交提示词').waitFor();
+  await page.getByRole('button',{name:'图片组 02',exact:true}).click();
+  await page.evaluate(()=>{window.__failApi={workbench_group_image:'测试图片读取失败'};});
+  await page.getByRole('button',{name:'去生成',exact:true}).click();
+  await page.getByRole('button',{name:'重试图片 A',exact:true}).waitFor();
+  await page.evaluate(()=>{window.__failApi={};});
+  await page.getByRole('button',{name:'重试图片 A',exact:true}).click();
+  await page.getByRole('img',{name:'参考图 A',exact:true}).waitFor();
+  assert.deepEqual(await page.evaluate(()=>window.__unexpectedCalls || []),[]);
+  assert.deepEqual(errors,[]);
+  console.log('PASS: failed preset/source/image/status/post reads show actionable errors and retry successfully');
   await browser.close();
 })().catch(async (e) => {
   console.error(e);

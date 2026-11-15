@@ -195,4 +195,6 @@ def test_queue_assembles_only_its_complete_pair_and_reuses_output(queue):
         assert raw[index]>200 and raw[2-index]<40
     q._assemble(batch['batch_id']);assert output.stat().st_mtime_ns==stamp
     assert all(item.get('assembly_id')==assembly['id'] for item in q.library_items() if item['kind']=='generation')
+    output.unlink()
+    assert not any(item.get('assembly_id') for item in q.library_items() if item['kind']=='generation')
 

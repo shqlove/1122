@@ -266,8 +266,9 @@ class WorkbenchMixin:
         queue = getattr(self, '_video_queue', None) or VideoQueue(self._service)
         for item in queue.library_items():
             items.append(item)
-            if item.get('path'):
-                source_links[str(Path(item['path']).resolve()).casefold()] = item
+            for file in (item.get('path'), item.get('archive_path')):
+                if file:
+                    source_links[str(Path(file).resolve()).casefold()] = item
             if item['kind'] == 'generation':
                 for group in all_groups:
                     if group['project_id'] == item['project_id'] and group['group_id'] == item['group_id'] and item['status'] in ('downloaded', 'completed'):

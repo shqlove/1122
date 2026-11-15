@@ -384,7 +384,12 @@ def test_first_baseline_golden_prompt_audio_and_exact_paid_snapshot(setup, monke
     expected = (Path(__file__).parent / 'fixtures/h3-first-submitted.txt').read_text(encoding='utf-8').strip()
     assert sheet['bound_prompt'] == expected
     assert [r['token'] for r in sheet['role_bindings']] == ['<Picture 1>', '<Picture 2>', '<Audio 1>']
-    assert sheet['references'][-1]['sha256'] == '5c040917a15eeaef8c433c858414da4297ae419656f66d74d9b5836ad9fc9bc5'
+    from dialogue_tool.h3_baseline import BASELINE
+    # CI may inject a synthetic voice; production still verifies the real file
+    # against this versioned manifest, which must retain the approved checksum.
+    manifest = json.loads((Path(__file__).parents[1] / 'dialogue_tool/resources/h3-first-v1/baseline.json').read_text(encoding='utf-8'))
+    assert manifest['audio_sha256'] == '5c040917a15eeaef8c433c858414da4297ae419656f66d74d9b5836ad9fc9bc5'
+    assert sheet['references'][-1]['sha256'] == BASELINE['audio_sha256']
     assert (sheet['duration'], sheet['resolution'], sheet['ratio'], sheet['use_context_ir']) == (15, '768P', '16:9', True)
     assert 'speech_plan' not in sheet and '身份为张世豪' not in sheet['bound_prompt']
     card = prepare(api, pid)

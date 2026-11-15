@@ -14,9 +14,13 @@ let saved: any = null;
 export function selectVideoSource(pid:string, gids:string[]) {saved={...saved,pid,gids};}
 
 function SourceImage({pid,gid,side}: any) {
-  const [src,setSrc] = useState('');
-  useEffect(()=> { let live=true; api('workbench_group_image',pid,gid,side).then(v=>{if(live)setSrc(v.url);}).catch(()=>{}); return()=>{live=false;}; },[pid,gid,side]);
-  return src ? <img src={src} alt={`参考图 ${side.toUpperCase()}`} style={{width:'48%',borderRadius:8}}/> : null;
+  const [src,setSrc] = useState(''), [error,setError] = useState(''), [attempt,setAttempt] = useState(0);
+  useEffect(()=> {
+    let live=true; setSrc(''); setError('');
+    api('workbench_group_image',pid,gid,side).then(v=>{if(live)setSrc(v.url);}).catch(e=>{if(live)setError(String(e));});
+    return()=>{live=false;};
+  },[pid,gid,side,attempt]);
+  return <div style={{width:'48%'}}>{error ? <div className="notice error" role="alert">参考图 {side.toUpperCase()} 加载失败：{error}<Button size="sm" variant="outline" onClick={()=>setAttempt(v=>v+1)}>重试图片 {side.toUpperCase()}</Button></div> : src ? <img src={src} onError={()=>setError('图片文件无法显示')} alt={`参考图 ${side.toUpperCase()}`} style={{width:'100%',borderRadius:8}}/> : <p className="muted">正在读取参考图 {side.toUpperCase()}…</p>}</div>;
 }
 
 export function VideoStudio({initialProjectId,initialGroupIds,onOpenTasks}: any) {
@@ -26,18 +30,28 @@ export function VideoStudio({initialProjectId,initialGroupIds,onOpenTasks}: any)
   const [form,setForm] = useState<any>(saved?.form || null), [preset,setPreset] = useState<any>(null);
   const [voiceSource,setVoiceSource] = useState(saved?.voiceSource || 'baseline');
   const [rows,setRows] = useState<any[]>([]), [error,setError] = useState(''), [modelError,setModelError] = useState('');
+  const [presetError,setPresetError] = useState(''), [sourceError,setSourceError] = useState(''), [jobsError,setJobsError] = useState('');
+  const [sourcesLoading,setSourcesLoading] = useState(true), [jobsLoaded,setJobsLoaded] = useState(false);
   const [adding,setAdding] = useState(false), [pending,setPending] = useState<Record<string,boolean>>({});
   const editor = useRef<HTMLTextAreaElement>(null);
-  const refresh = () => api('workbench_video_jobs').then(setRows);
+  const refresh = () => api('workbench_video_jobs').then(v=>{setRows(v);setJobsLoaded(true);setJobsError('');}).catch(e=>setJobsError(String(e)));
+  const loadSources = () => {
+    setSourceError(''); setSourcesLoading(true);
+    api('workbench_video_sources').then(v=>{setSources(v);setPid((old:string)=>old || v[0]?.id || '');})
+      .catch(e=>setSourceError(String(e))).finally(()=>setSourcesLoading(false));
+  };
+  const loadPreset = () => {
+    setPresetError('');
+    api('workbench_video_preset').then(v=>{setPreset(v);setForm((old:any)=>old || v);}).catch(e=>setPresetError(String(e)));
+  };
   const loadModels = () => {setModelError(''); api('workbench_video_models').then(setModels).catch(e=>setModelError(String(e)));};
   useEffect(()=> {
-    api('workbench_video_sources').then(v=>{setSources(v);if(!pid && v.length)setPid(v[0].id);}).catch(e=>setError(String(e)));
-    api('workbench_video_preset').then(v=>{setPreset(v);setForm((old:any)=>old || v);}).catch(e=>setError(String(e)));
-    refresh().catch(e=>setError(String(e))); loadModels();
-    const timer = setInterval(()=>refresh().catch(()=>{}),2500); return()=>clearInterval(timer);
+    loadSources(); loadPreset(); refresh(); loadModels();
+    const timer = setInterval(refresh,2500); return()=>clearInterval(timer);
   },[]);
   useEffect(()=> {saved={pid,gids,form,voiceSource};},[pid,gids,form,voiceSource]);
   const groups = sources.find(p=>p.id===pid)?.groups || [];
+  const validSelection = gids.length>0 && gids.every(id=>groups.some((g:any)=>g.id===id && !g.needs_review));
   const isH3 = form?.model === 'MiniMax-H3';
   const capability = isH3 ? h3 : models.find(m=>m.model===form?.model);
   const locked = form?.baseline_id === 'h3-first-v1';
@@ -58,27 +72,32 @@ export function VideoStudio({initialProjectId,initialGroupIds,onOpenTasks}: any)
     update({common_prompt:form.common_prompt.slice(0,start)+text+form.common_prompt.slice(end)});
     requestAnimationFrame(()=>{el?.focus();el?.setSelectionRange(start+text.length,start+text.length);});
   };
-  if(!form)return <p>正在读取生成配置…</p>;
+  if(!form)return presetError ? <div className="notice error" role="alert">生成配置加载失败：{presetError}<Button variant="outline" onClick={loadPreset}>重试生成配置</Button></div> : <p>正在读取生成配置…</p>;
   return <div className="video-studio">
     <div className="section-heading"><span className="muted">提交进度和历史视频统一在“我的任务”查看</span><Button variant="outline" onClick={onOpenTasks}>查看我的任务</Button></div>
     <p className="notice subtle">素材来自图片组，生成任务独立保存。逐条确认费用，其他任务和项目分析不会阻塞这里。分段完成后自动合并原片，后期另行开始。</p>
     {error && <p className="notice error" role="alert">{error}</p>}
+    {presetError && <div className="notice error" role="alert">生成配置加载失败：{presetError}<Button variant="outline" onClick={loadPreset}>重试生成配置</Button></div>}
     <Card><CardContent>
       <div className="section-heading"><h2>新建视频</h2><Badge variant="secondary">全能参考 · 图片 + 音色</Badge></div>
       <label>素材来源<select aria-label="素材来源" value={pid} onChange={e=>{setPid(e.target.value);setGids([]);}}>
         <option value="" disabled>选择素材项目</option>{sources.map(p=><option key={p.id} value={p.id}>{p.name}</option>)}
       </select></label>
+      <Button size="sm" variant="outline" disabled={sourcesLoading} onClick={loadSources}>刷新素材来源</Button>
+      {sourceError && <p className="notice error" role="alert">素材来源加载失败：{sourceError}，请刷新素材来源。</p>}
+      {!sourceError && !sourcesLoading && !groups.length && <p className="notice">当前来源没有可用图片组，请在项目中完成视频分析和选图后刷新。</p>}
+      {!sourcesLoading && gids.length>0 && !validSelection && <p className="notice">所选图片组已变化或人物待确认，请到来源图片组核对后重新选择。</p>}
       <div className="video-source-grid">{groups.map((g:any)=><label key={g.id} className="video-source">
         <span><input type="checkbox" disabled={g.needs_review} checked={gids.includes(g.id)} onChange={e=>setGids(ids=>e.target.checked?[...ids,g.id]:ids.filter(id=>id!==g.id))}/> 第 {g.number} 组 {g.needs_review && '· 人物待确认'}</span>
         {gids.includes(g.id) && <div className="row"><SourceImage pid={pid} gid={g.id} side="a"/><SourceImage pid={pid} gid={g.id} side="b"/></div>}
       </label>)}</div>
       <div className="row" style={{flexWrap:'wrap',margin:'16px 0'}}>
-        <Button variant={locked?'secondary':'outline'} onClick={()=>{setForm(preset);setVoiceSource('baseline');}}>使用成功模板</Button>
+        <Button disabled={!preset} variant={locked?'secondary':'outline'} onClick={()=>{setForm(preset);setVoiceSource('baseline');}}>使用成功模板</Button>
         <Button variant={!locked?'secondary':'outline'} onClick={()=>update({baseline_id:'custom',auto_split_dialogue:false,...(isH3?{verbatim_prompt:true}:{})})}>手动配置参数</Button>
       </div>
       <div className="video-parameters">
         <label>渠道<select aria-label="生成渠道" value={isH3?'h3':'dreamina'} onChange={e=>switchModel(e.target.value==='h3'?'MiniMax-H3':models[0]?.model)}>
-          <option value="h3">优云智算 H3</option><option value="dreamina" disabled={!models.length}>即梦</option>
+          <option value="h3" disabled={!preset}>优云智算 H3</option><option value="dreamina" disabled={!models.length}>即梦</option>
         </select></label>
         <label>模型<select aria-label="视频模型" value={form.model} onChange={e=>switchModel(e.target.value)}>{(isH3?[h3]:models).map(m=><option key={m.model} value={m.model}>{m.label}</option>)}</select></label>
         <label>时长（秒）<Input aria-label="视频时长" type="number" min={capability?.min} max={capability?.max} value={form.duration} disabled={locked || form.auto_split_dialogue} onChange={e=>update({duration:Number(e.target.value)})}/></label>
@@ -99,12 +118,14 @@ export function VideoStudio({initialProjectId,initialGroupIds,onOpenTasks}: any)
         <label><input type="checkbox" checked={!!form.aigc_watermark} onChange={e=>update({aigc_watermark:e.target.checked})}/> AIGC 水印</label>
         <label>平台 Skill ID（可留空）<Input value={form.skill_id || ''} disabled={!form.use_context_ir} onChange={e=>update({skill_id:e.target.value})}/></label>
       </details>}
-      <Button style={{marginTop:20}} disabled={adding || !gids.length || !capability} onClick={async()=>{
+      <Button style={{marginTop:20}} disabled={adding || sourcesLoading || !!sourceError || !validSelection || !capability} onClick={async()=>{
         setAdding(true);setError('');try{const result=await api('workbench_video_create',pid,gids,form,voiceSource);if(result.errors?.length)setError(result.errors.map((e:any)=>`第 ${groups.find((g:any)=>g.id===e.group_id)?.number || e.group_id} 组：${e.message}`).join('；'));await refresh();}catch(e){setError(String(e));}finally{setAdding(false);}
       }}>{adding?'保存素材副本…':'添加生成任务并报价'}</Button>
     </CardContent></Card>
     <div className="section-heading" style={{marginTop:24}}><h2>逐条任务记录 · {rows.length}</h2><Button variant="outline" onClick={()=>refresh().catch(e=>setError(String(e)))}>刷新记录</Button></div>
-    {!rows.length && <p className="muted">添加任务后，每条视频会在这里单独显示报价和提交按钮。</p>}
+    {jobsError && <p className="notice error" role="alert">任务状态暂未更新：{jobsError}。保留上次记录，可点击刷新记录重试。</p>}
+    {!jobsLoaded && !jobsError && <p className="muted">正在读取任务记录…</p>}
+    {jobsLoaded && !jobsError && !rows.length && <p className="muted">添加任务后，每条视频会在这里单独显示报价和提交按钮。</p>}
     {rows.map(row=><Card key={row.id}><CardContent>
       <div className="section-heading"><h3>{row.source_project_name} · 第 {row.group_number} 组 · 第 {row.part}/{row.part_count} 段</h3><Badge variant="secondary">{names[row.phase] || row.phase}</Badge></div>
       <p>{row.model} · {row.duration} 秒 · {row.ratio} · {row.resolution} {row.task_status && `· ${row.task_status}`}</p>

@@ -310,6 +310,7 @@ class VideoQueue:
                 'role_bindings': task.get('request_snapshot', {}).get('role_bindings', task.get('references', [])),
                 'context_ir': params.get('use_context_ir'), 'card': cfg.get('pending_approval'), 'submit_id': task.get('submit_id'),
                 'task_id': task.get('task_id'), 'task_status': task.get('status'), 'output': task.get('output'),
+                'archive_path': task.get('archive_output'),
                 'task_error': task.get('submit_error') or task.get('error') or task.get('download_error') or task.get('query_error'),
                 'busy': p['id'] in self.active,
                 'references': [{'side': side, 'path': p['groups'][0]['repaired_' + side]} for side in ('a','b')] +
@@ -327,7 +328,8 @@ class VideoQueue:
                     continue
                 meta = plan['origin']
                 key = 'video-assembly:' + p['id'] + ':' + meta['source_group_id']
-                links.update({part['group_id']: key for part in plan['parts']})
+                if Path(out['output']).is_file():
+                    links.update({part['group_id']: key for part in plan['parts']})
                 items.append({'id':key, 'kind':'assembly', 'project_id':meta['source_project_id'], 'project_name':meta['source_project_name'],
                     'group_id':meta['source_group_id'], 'group_ids':[meta['source_group_id']], 'group_number':meta['group_number'],
                     'label':'完整拼接', 'status':'downloaded', 'path':out['output'], 'available':Path(out['output']).is_file(),
@@ -340,7 +342,8 @@ class VideoQueue:
         for row in self.rows():
             items.append({'id':'video-job:'+row['id'], 'kind':'generation', 'project_id':row['source_project_id'],
                 'project_name':row['source_project_name'], 'group_id':row['source_group_id'], 'group_number':row['group_number'],
-                'status':row['task_status'] or row['phase'], 'path':row['output'], 'available':bool(row['output'] and Path(row['output']).is_file()),
+                'status':row['task_status'] or row['phase'], 'path':row['output'], 'archive_path':row['archive_path'],
+                'available':bool(row['output'] and Path(row['output']).is_file()),
                 'duration':row['duration'], 'model':row['model'], 'resolution':row['resolution'], 'ratio':row['ratio'],
                 'created_at':row['created_at'], 'submit_id':row['submit_id'], 'task_id':row['task_id'],
                 'queue_phase':row['phase'], 'error':row.get('error') or row['task_error'], 'job_id':row['id'],

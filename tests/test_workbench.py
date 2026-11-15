@@ -353,3 +353,45 @@ def test_go_generate_rejects_stale_selection_before_archiving(wb):
     with pytest.raises(ValueError, match='选择已变化'):
         api.workbench_enter_generation(p['id'], ['g1'])
     assert api._service.projects.get(p['id']) == p
+
+
+def test_independent_single_video_reaches_post_without_source_mutation(wb, monkeypatch):
+    from PIL import Image
+    from dialogue_tool.generation import _sha
+    api, p, root, source, _ = wb
+    q = api._video_queue
+    monkeypatch.setattr(q, '_start', lambda *args: False)
+    for side in ('a', 'b'):
+        image = Path(p['directory']) / (side + '.png')
+        Image.new('RGB', (80, 60), 'red').save(image)
+        p['groups'][0]['repaired_' + side] = str(image)
+    api._service.projects.save(p)
+    api.current = p['id']
+    api.busy = True
+    cfg = api.workbench_video_preset()
+    cfg.update(baseline_id='custom', auto_split_dialogue=False, common_prompt='@男主说“你好”。')
+    jid = api.workbench_video_create(p['id'], ['g1'], cfg, 'baseline')['job_ids'][0]
+    assert api._service.projects.get(p['id']) == p
+    job = q.service.projects.get(jid)
+    local_output = Path(job['directory']) / 'downloaded.mp4'
+    local_output.write_bytes(source.read_bytes())
+    job['generation']['tasks'] = {'g1': {'status': 'downloaded', 'output': str(local_output),
+                                       'archive_output': str(source), 'sha256': _sha(source)}}
+    job['queue_state']['phase'] = 'downloaded'
+    q.service.projects.save(job)
+    key = 'video-job:' + jid
+    item = next(i for i in api.workbench_library()['items'] if i['id'] == key)
+    assert item['available'] and item['archive_path'] == str(source)
+    assert item['project_id'] == p['id'] and item['group_id'] == 'g1'
+    launches = []
+    monkeypatch.setattr('dialogue_tool.workbench.subprocess.Popen', lambda *a, **kw: launches.append(a))
+    assert launches == []
+    result = api.workbench_start_post([key])
+    request = read_json(root / 'workbench-runs' / result['id'] / 'request.json')
+    assert len(launches) == 1
+    assert request['items'][0]['item_id'] == key
+    assert request['items'][0]['source'] == str(source)
+    assert request['items'][0]['source_sha256'] == _sha(source)
+    finished = next(i for i in api.workbench_library()['items'] if i['id'] == 'post:batch1:job1')
+    assert finished['source_id'] == key and finished['project_name'] == p['name']
+    assert api._service.projects.get(p['id']) == p
