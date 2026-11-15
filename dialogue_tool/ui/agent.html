@@ -1,0 +1,43 @@
+<aside class="agent-panel" id="agentPanel">
+ <div class="agent-heading"><div><h2>制作 Agent</h2><span class="note">直接操作项目 · 独立连续对话</span></div><button class="small" onclick="agentNew()">新对话</button></div>
+ <div class="agent-scroll-body">
+ <details class="agent-settings-drawer"><summary>模型与连接设置</summary>
+ <div class="agent-settings">
+  <label>聊天模型<select id="agentModel" onchange="agentEfforts()" aria-label="聊天模型"><option value="">连接后加载模型</option></select></label>
+  <label>思考强度<select id="agentEffort" aria-label="思考强度"></select></label>
+ </div>
+ <div class="agent-connection"><span id="agentConnection" role="status" aria-live="polite">未连接，请点击连接 Agent</span><button class="primary" id="agentConnect" onclick="agentConnect()">连接 Agent</button></div>
+ <div class="agent-connection"><span id="jimengConnection" role="status" aria-live="polite">即梦登录可在这里检查和恢复</span><button id="jimengAuthOpen" class="hidden" onclick="call(()=>api.generation_open_auth())">打开授权页</button><button id="jimengConnect" onclick="connectJimeng()">连接即梦</button></div>
+ <div class="h3-settings">
+  <p class="note">优云智算 H3 · 视频模型 MiniMax-H3</p>
+  <label for="h3ApiKey">视频工作台 API 密钥</label>
+  <input id="h3ApiKey" type="password" autocomplete="off" spellcheck="false" placeholder="填写 sk-ml- 开头的密钥">
+  <div class="toolbar"><button id="h3Save" onclick="connectH3(true)">保存并测试</button><button id="h3Test" onclick="connectH3(false)">测试连接</button></div>
+  <p id="h3Connection" class="note" role="status" aria-live="polite">正在读取 H3 连接设置…</p>
+  <p class="note">密钥保存在本机。测试连接会查询积分余额。</p>
+ </div>
+ </details>
+ <div class="agent-scope-bar">  <label class="agent-scope">任务范围<select id="agentScope" onchange="agentScopeLabel()"><option value="current">当前图片组</option><option value="selected">已勾选且已确认的组</option><option value="all">全部已确认组</option></select></label>
+  <div class="agent-scope note" id="agentScopeLabel">请选择项目</div>
+</div>
+ <div id="agentMessages" class="agent-messages" aria-live="polite"><p class="note">在这里要求批量编写提示词、绑定人物与音色、选择即梦或优云智算 H3 准备任务。结果直接保存到项目。聊天使用本机 Codex 登录。</p></div>
+ <div id="agentChannelChoice" class="agent-approval hidden"><span>这次用什么生成？</span><button id="chooseDreamina" onclick="agentChooseChannel('dreamina')">即梦</button><button id="chooseH3" onclick="agentChooseChannel('compshare')">优云智算 H3</button></div>
+ <div id="agentApproval" class="agent-approval hidden"></div>
+ <div class="agent-voice-bar" id="agentLibrary"><span id="agentVoiceLabel">音色：未绑定</span><button onclick="$('agentAssetDialog').showModal();agentLoadFiles()">管理</button></div>
+
+ </div>
+ <div class="agent-compose"><div id="agentPendingFiles"></div><button id="agentAttach" onclick="agentChooseFiles(false)">添加文件</button><textarea id="agentInput" placeholder="例如：给已勾选组共用这份提示词，按各组图片绑定 @男主、@聆听者，沿用豪哥音色。先准备，不提交。" onkeydown="if(event.ctrlKey&&event.key==='Enter'){event.preventDefault();agentSend()}" aria-label="发送给制作 Agent 的任务"></textarea><div class="agent-actions"><span class="note">Ctrl + Enter 发送</span><button id="agentStop" onclick="agentStop()" disabled>停止</button><button class="primary" id="agentSend" onclick="agentSend()" disabled>发送任务</button></div></div>
+</aside>
+
+<dialog id="agentCreditDialog" class="agent-credit-dialog">
+ <div class="dialog-header"><h2>确认生成费用</h2><button onclick="$('agentCreditDialog').close()">关闭</button></div>
+ <div id="agentCreditDetail"></div><p id="agentCreditError" role="alert" class="credit-error"></p>
+ <div class="agent-actions"><button id="agentRefreshCredits" onclick="agentRefreshCredits()">刷新报价与余额</button><button id="agentApproveButton" class="primary" onclick="agentApprove()" disabled>确认额度并提交</button></div>
+</dialog>
+
+<dialog id="agentAssetDialog" class="agent-credit-dialog">
+ <div class="dialog-header"><h2>音色与附件</h2><button onclick="$('agentAssetDialog').close()">关闭</button></div>
+ <p class="note">绑定到当前任务范围；保存音色不会自动更换已有绑定。</p>
+ <button onclick="agentChooseFiles(true)">保存新音色</button>
+ <div id="agentVoices"></div><details><summary>其他已保存附件</summary><div id="agentSavedFiles"></div></details>
+</dialog>

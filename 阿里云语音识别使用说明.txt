@@ -1,0 +1,16 @@
+阿里云语音识别接入
+
+1. 在 https://help.aliyun.com/zh/model-studio/get-api-key 按官方指引开通百炼并创建 API Key。建议北京地域。确认该账号有 qwen3-asr-flash 的调用权限及额度。
+2. 双击本目录“配置阿里云语音识别.bat”，选择Key所属地域，输入业务空间Workspace ID（可留空用传统域名），在隐藏输入框粘贴Key并回车。不要把Key发到聊天。
+3. 重启工作台，在聊天里说：“用阿里云识别第1组成片的台词”，或“识别第1组成片7到14秒在说什么”。处理范围需包含对应图片组。
+4. 附件支持音频和视频；先添加文件，再明确要求识别。普通读取附件不会触发付费识别。
+
+直接命令：
+.venv\Scripts\python.exe -m dialogue_tool asr-status
+.venv\Scripts\python.exe -m dialogue_tool transcribe "视频完整路径.mp4" --start 7 --end 14
+
+采用 qwen3-asr-flash 官方OpenAI兼容HTTP接口，直接上传本地提取的单声道16kHz WAV，无需OSS/MCP。单次限制180秒以满足Base64体积限制。相同内容/范围/模型成功结果在本机缓存，重复检查复用结果。失败不自动重试，以免重复计费。
+配置保存于当前用户目录 .dialogue-workbench/aliyun-asr.json，不保存到项目或聊天。也支持DASHSCOPE_API_KEY环境变量（优先于配置文件中的Key）。配置文件含密钥，不要分享该文件。
+识别结果保存在项目asr-results目录，直接命令结果保存在workspaces/asr-results。无预期台词引导，避免识别结果被原文污染。
+该接口不提供逐字/逐句时间戳，返回start/end仅指实际截取范围。不能把转写正确当作声音无杂音、音色相同或口型合格。
+官方接口：https://help.aliyun.com/zh/model-studio/qwen-asr-api-reference

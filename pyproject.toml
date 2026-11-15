@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dialogue-video-tool"
+version = "0.1.0"
+description = "CPU-first dialogue workflow and Dreamina Canvas integration for Windows and macOS"
+requires-python = ">=3.11,<3.13"
+dependencies = ["Pillow>=10,<13", "jsonschema>=4.22,<5", "scenedetect>=0.7.2,<0.8", "opencv-python>=4.8,<5"]
+
+[project.optional-dependencies]
+repair = ["torch>=2.2,<3", "numpy>=1.26,<3"]
+test = ["pytest>=8,<10"]
+desktop = ["pywebview>=5,<7"]
+
+[project.scripts]
+dialogue-tool = "dialogue_tool.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["dialogue_tool*"]
+
+[tool.setuptools.package-data]
+dialogue_tool = ["ui/*.html", "ui/*.css", "ui/*.js", "ui/app/*.html", "ui/app/*.css", "ui/app/*.js", "ui/brand/logo.png", "ui/brand/workbench.ico", "resources/h3-first-v1/*.json", "resources/h3-first-v1/*.mp3"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
