@@ -395,3 +395,63 @@ def test_independent_single_video_reaches_post_without_source_mutation(wb, monke
     finished = next(i for i in api.workbench_library()['items'] if i['id'] == 'post:batch1:job1')
     assert finished['source_id'] == key and finished['project_name'] == p['name']
     assert api._service.projects.get(p['id']) == p
+
+
+def test_global_recycle_restore_preserves_history_files_and_scope(wb):
+    api, p, _, source, output = wb
+    scope = [{'project_id': p['id'], 'group_id': 'g1', 'frame_a': 1, 'frame_b': 2}]
+    before = api._service.projects.get(p['id'])
+    assert api.workbench_group_batch(scope, 'trash')[0]['ok']
+    assert api.workbench_library()['groups'][0]['trashed']
+    assert api.workbench_video_sources()[0]['groups'] == []
+    with pytest.raises(ValueError, match='回收站'):
+        api.workbench_video_create(p['id'], ['g1'], {})
+    assert api._service.projects.get(p['id']) == before
+    assert source.is_file() and output.is_file()
+    assert api.workbench_tasks()['items']
+    assert api.workbench_group_batch(scope, 'restore')[0]['ok']
+    assert not api.workbench_library()['groups'][0]['trashed']
+    assert len(api.workbench_video_sources()[0]['groups']) == 1
+    item = next(i for i in api.workbench_library()['items'] if i['kind'] == 'generation')
+    assert api.workbench_media_batch([item['id']], 'trash')[0]['ok']
+    assert api._library_item(item['id'])['trashed']
+    with pytest.raises(ValueError, match='回收站'):
+        api.workbench_start_post([item['id']])
+    assert api.workbench_media_batch([item['id']], 'restore')[0]['ok']
+    assert source.is_file() and not api._library_item(item['id'])['trashed']
+
+
+def test_global_confirm_does_not_switch_project_and_failure_continues(wb):
+    api, p, *_ = wb
+    api.current = 'other-current-project'
+    api.busy = True  # Unrelated work is not a global veto.
+    scopes = [{'project_id': p['id'], 'group_id': 'g1', 'frame_a': 99, 'frame_b': 2},
+              {'project_id': p['id'], 'group_id': 'missing', 'frame_a': 1, 'frame_b': 2}]
+    result = api.workbench_group_batch(scopes, 'confirm')
+    assert all(not r['ok'] for r in result)
+    good = {'project_id': p['id'], 'group_id': 'g1', 'frame_a': 1, 'frame_b': 2}
+    assert api.workbench_group_batch([scopes[1], good], 'unconfirm')[1]['ok']
+    assert api._service.projects.get(p['id'])['groups'][0]['needs_review']
+    assert api.current == 'other-current-project'
+    assert api.workbench_group_batch([good], 'confirm')[0]['ok']
+    assert not api._service.projects.get(p['id'])['groups'][0]['needs_review']
+    assert api._service.projects.get(p['id'])['generation']['tasks']['g1']['status'] == 'downloaded'
+
+
+def test_batch_export_checks_content_and_never_overwrites(wb, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import sys
+    monkeypatch.setitem(sys.modules, 'webview', SimpleNamespace(FileDialog=SimpleNamespace(FOLDER='folder')))
+    api, _, _, source, _ = wb
+    destination = tmp_path / 'exports'; destination.mkdir()
+    api._window = SimpleNamespace(create_file_dialog=lambda *a, **k: [str(destination)])
+    item = next(i for i in api.workbench_library()['items'] if i['kind'] == 'generation')
+    result = api.workbench_export_selected([item['id']])
+    assert result[0]['ok']
+    target = Path(result[0]['path'])
+    assert target.read_bytes() == source.read_bytes()
+    assert api.workbench_export_selected([item['id']])[0]['ok']
+    target.write_bytes(b'user modified export')
+    assert not api.workbench_export_selected([item['id']])[0]['ok']
+    assert target.read_bytes() == b'user modified export'
+    assert not list(destination.glob('*.tmp'))

@@ -1,5 +1,6 @@
 """Independent video jobs: immutable inputs, one quote and submission identity per clip."""
 import copy
+import queue
 import shutil
 import threading
 import time
@@ -36,6 +37,8 @@ class VideoQueue:
         self.api = WorkflowAPI(self.service)
         self.lock = threading.RLock()
         self.active = set()
+        self.waiting = set()
+        self.lanes = {}
         self.stop = threading.Event()
         self.assembly_lock = threading.Lock()
 
@@ -49,15 +52,32 @@ class VideoQueue:
             if jid in self.active:
                 return False
             self.active.add(jid)
+            self.waiting.add(jid)
+            job = self.service.projects.get(jid)
+            phase = job.get('queue_state', {}).get('phase')
+            lane = 'tracking' if phase in ('submitting', 'tracking') or any(t.get('submit_id') for t in job.get('generation', {}).get('tasks', {}).values()) else 'prepare'
+            if lane not in self.lanes:
+                pending = self.lanes[lane] = queue.Queue()
+                def worker():
+                    while not self.stop.is_set():
+                        try: task = pending.get(timeout=.2)
+                        except queue.Empty: continue
+                        try: task()
+                        finally: pending.task_done()
+                for _ in range(8 if lane == 'tracking' else 4):
+                    threading.Thread(target=worker, daemon=True).start()
         def work():
+            with self.lock:
+                self.waiting.discard(jid)
             try:
-                operation()
+                if not self.stop.is_set():
+                    operation()
             except Exception as exc:
                 self._save_state(jid, 'attention', str(exc))
             finally:
                 with self.lock:
                     self.active.discard(jid)
-        threading.Thread(target=work, daemon=True).start()
+        self.lanes[lane].put(work)
         return True
 
     def _copy_group(self, source, group, folder, voice=None):
@@ -84,11 +104,15 @@ class VideoQueue:
             bindings.update(voice_path=str(target), voice_name=source_voice.name)
         return result
 
-    def create(self, source_id, group_ids, config, voice_source='baseline'):
+    def create(self, source_id, group_ids, config, voice_source='baseline', creation_id=None):
         if voice_source not in ('baseline', 'group'):
             raise ValueError('请选择成功模板音色或图片组音色')
         if config.get('baseline_id') == 'h3-first-v1' and voice_source != 'baseline':
             raise ValueError('成功模板使用原始参考音色，请先切换手动配置')
+        from .batch_workbench import trash_records, group_key
+        trash = trash_records(self.source)
+        if any(group_key(source_id, gid) in trash for gid in group_ids):
+            raise ValueError('图片组已移入回收站，请先恢复')
         source = self.source.projects.get(source_id)
         groups = {g['id']: g for g in source['groups']}
         if not group_ids or len(set(group_ids)) != len(group_ids) or not set(group_ids).issubset(groups):
@@ -97,7 +121,7 @@ class VideoQueue:
             result = {'job_ids': [], 'batch_ids': [], 'errors': []}
             for gid in group_ids:
                 try:
-                    created = self.create(source_id, [gid], config, voice_source)
+                    created = self.create(source_id, [gid], config, voice_source, creation_id)
                     result['job_ids'].extend(created['job_ids'])
                     result['batch_ids'].append(created['batch_id'])
                 except Exception as exc:
@@ -138,7 +162,7 @@ class VideoQueue:
                     job_folder.mkdir()
                     job['groups'] = [self._copy_group(p, p['groups'][0], job_folder)]
                 job.update(id=jid, directory=str(job_folder), created_at=time.time(), video_job={
-                    'batch_id': batch_id, 'source_project_id': source_id, 'source_project_name': source['name'],
+                    'batch_id': batch_id, 'creation_id': creation_id, 'source_project_id': source_id, 'source_project_name': source['name'],
                     'source_group_id': gid, 'group_number': next(i for i,g in enumerate(source['groups'],1) if g['id']==gid),
                     'part': index, 'part_count': len(prompts), 'requested_config': config, 'voice_source': voice_source})
                 job['generation'].update(global_prompt=prompt, baseline_id='custom')
@@ -308,7 +332,7 @@ class VideoQueue:
                 'model': params['model'], 'duration': params['duration'], 'resolution': params['resolution'], 'ratio': params['ratio'],
                 'prompt': task.get('request_snapshot', {}).get('bound_prompt') or cfg['global_prompt'],
                 'role_bindings': task.get('request_snapshot', {}).get('role_bindings', task.get('references', [])),
-                'context_ir': params.get('use_context_ir'), 'card': cfg.get('pending_approval'), 'submit_id': task.get('submit_id'),
+                'queued': p['id'] in self.waiting, 'context_ir': params.get('use_context_ir'), 'card': cfg.get('pending_approval'), 'submit_id': task.get('submit_id'),
                 'task_id': task.get('task_id'), 'task_status': task.get('status'), 'output': task.get('output'),
                 'archive_path': task.get('archive_output'),
                 'task_error': task.get('submit_error') or task.get('error') or task.get('download_error') or task.get('query_error'),

@@ -106,11 +106,21 @@ const assert = require("node:assert/strict");
               if (name === "workbench_video_preset") return {model:'MiniMax-H3',duration:15,ratio:'16:9',resolution:'768P',prompt_mode:'shared',common_prompt:'原镜头，台词：“原台词”，原声音。',baseline_id:'h3-first-v1',auto_split_dialogue:true,use_context_ir:true,preserve_prompt:true,audio_first:false};
               if (name === "workbench_video_models") return [{model:'seedance_2.5',label:'即梦 2.5',min:4,max:30,ratios:['16:9','4:3'],resolutions:['720p','1080p','4k']}];
               if (name === "workbench_video_jobs") return window.__videoJobs || [];
-              if (name === "workbench_video_create") {
+              if (name === "workbench_video_create_batch") {
+                const scope=args[0],config=args[1],requestId=args[3];
+                window.__batchReceipts ||= {};
+                if(window.__batchReceipts[requestId])return window.__batchReceipts[requestId];
+                const result={items:[]};
+                for(const source of scope){
+                if(window.__failGroup===source.project_id){result.items.push({...source,status:'failed',message:'测试单组失败'});continue;}
+                const args=[source.project_id,[source.group_id],config];
                 const n=(window.__videoJobs || []).length+1;
                 (window.__videoJobs ||= []).push({id:'job'+n,source_project_name:'素材项目',group_number:1,part:1,part_count:1,model:args[2].model,duration:15,ratio:'16:9',resolution:args[2].resolution,phase:'awaiting_approval',references:[],prompt:args[2].common_prompt,card:{id:'card'+n,ceiling:155,available_credits:9999,sufficient:true,provider:'compshare',use_context_ir:true}});
-                return {job_ids:['job'+n]};
+                result.items.push({...source,status:'created',job_ids:['job'+n],batch_id:'batch'+n});
+                }
+                window.__batchReceipts[requestId]=result;return result;
               }
+              if(name==='workbench_video_approve_batch'){return args[0].map(c=>{window.__videoJobs.find(j=>j.id===c.job_id).phase='submitting';return {id:c.job_id,ok:true};});}
               if (name === "workbench_video_approve") {window.__videoJobs.find(j=>j.id===args[0]).phase='submitting'; return true;}
               if (name === "select_project") { p.id = args[0]; p.name = "另一个项目"; p.groups = []; return true; }
               if (name === "agent_stop") { window.__agentBusy = false; return true; }
@@ -128,10 +138,12 @@ const assert = require("node:assert/strict");
                   version: JSON.stringify(p),
                   message: "准备就绪",
                 };
+              if(name==='workbench_group_batch'){return args[0].map(v=>{window.__trashGroups ||= {}; window.__trashGroups[v.project_id+':'+v.group_id]=args[1]==='trash';return {...v,ok:true};});}
+              if(name==='workbench_media_batch')return args[0].map(id=>({id,ok:true}));
               if (name === "workbench_library")
                 return {
                   items: window.__overviewFixtures ? [...items.map(v => window.__assemblyFixture && v.kind === 'generation' ? {...v, project_id:'other', assembly_id:'assembly1'} : v), {id: "assembly1", kind: "assembly", project_id: "other", project_name: "另一集", label: "完整拼接", status: "downloaded", available: true, duration: 30, context_ir: false, parts: []}] : items,
-                  groups: [{id: "p1:g1", project_id: "p1", project_name: "第一集", group_id: "g1", group_number: 1, person_a: "豪哥", generated: 1}, {id: "other:g1", project_id: "other", project_name: "另一集", group_id: "g1", group_number: 1, person_a: "黑衣男子", generated: 0}],
+                  groups: [{id: "p1:g1", project_id: "p1", project_name: "第一集", group_id: "g1", group_number: 1, person_a: "豪哥", generated: 1}, {id: "other:g1", project_id: "other", project_name: "另一集", group_id: "g1", group_number: 1, person_a: "黑衣男子", generated: 0}].map(g=>({...g,trashed:!!window.__trashGroups?.[g.id]})),
                   projects: [
                     { id: p.id, name: p.name, groups: p.groups.length, generated: 1 },
                     ...(window.__imported ? Array.from({length: 20}, (_, i) => ({id: `old${i}`, name: `历史项目${i}`, groups: 1, generated: 0})) : []),
@@ -225,7 +237,7 @@ const assert = require("node:assert/strict");
                     supportedReasoningEfforts: [{ reasoningEffort: "low" }],
                   },
                 ]; }
-              if (['start_analysis','agent_send'].includes(name)) return true;
+              if (['start_analysis','agent_send','agent_send_global'].includes(name)) return true;
               (window.__unexpectedCalls ||= []).push(name);
               throw new Error('Unmocked desktop API: ' + name);
             },
@@ -239,9 +251,10 @@ const assert = require("node:assert/strict");
         .resolve(__dirname, "../../validation/workbench.html")
         .replaceAll("\\", "/"),
   );
-  await page.getByRole("heading", { name: "项目", exact: true }).waitFor();
+  await page.getByRole("heading", { name: "图片组总览", exact: true }).waitFor();
+  await page.getByRole("button", {name:"导入与拆解",exact:true}).click();
   assert.equal(await page.locator(".project-card").count(), 1);
-  await page.getByRole("button", { name: "图片组 02", exact: true }).click();
+  await page.getByRole("button", { name: "来源图片组", exact: true }).click();
   await page.getByRole("button", { name: "查看与编辑" }).click();
   await page.getByRole("dialog").waitFor();
   assert.equal(
@@ -249,14 +262,14 @@ const assert = require("node:assert/strict");
     "豪哥，深色外套",
   );
   await page.keyboard.press("Escape");
-  await page.getByRole("button", { name: "视频生成 03", exact: true }).click();
+  await page.getByRole("button", { name: "视频生成", exact: true }).click();
   await page.getByLabel('提交提示词').waitFor();
   assert.equal(await page.getByLabel('Context-IR 智能优化').isChecked(),true);
   await page.getByLabel('提交提示词').fill('切页后保留草稿');
-  await page.getByRole('button',{name:'项目 01',exact:true}).click();
-  await page.getByRole('button',{name:'视频生成 03',exact:true}).click();
+  await page.getByRole('button',{name:'导入与拆解',exact:true}).click();
+  await page.getByRole('button',{name:'视频生成',exact:true}).click();
   assert.equal(await page.getByLabel('提交提示词').inputValue(),'切页后保留草稿');
-  await page.getByRole('button',{name:'图片组 02',exact:true}).click();
+  await page.getByRole('button',{name:'来源图片组',exact:true}).click();
   await page.getByRole('button',{name:'去生成',exact:true}).click();
   assert.equal(await page.evaluate(()=>window.__calls.filter(v=>v[0]==='workbench_enter_generation').length),0);
   await page.getByRole('button',{name:'使用成功模板',exact:true}).click();
@@ -264,6 +277,7 @@ const assert = require("node:assert/strict");
   await page.getByRole('button',{name:'添加生成任务并报价',exact:true}).click();
   await page.getByRole('button',{name:'确认并提交本条 · 155 积分',exact:true}).click();
   await page.getByText('提交中',{exact:true}).waitFor();
+  await page.locator('.video-source input').check();
   await page.getByRole('button',{name:'添加生成任务并报价',exact:true}).click();
   await page.getByRole('button',{name:'确认并提交本条 · 155 积分',exact:true}).waitFor();
   assert.equal(await page.getByRole('button',{name:'确认并提交本条 · 155 积分',exact:true}).isEnabled(),true);
@@ -273,17 +287,19 @@ const assert = require("node:assert/strict");
   await page.getByLabel('生成渠道',{exact:true}).selectOption('dreamina');
   await page.getByLabel('视频清晰度',{exact:true}).selectOption('1080p');
   assert.equal(await page.getByLabel('视频时长',{exact:true}).getAttribute('max'),'30');
+  await page.locator('.video-source input').check();
   await page.getByRole('button',{name:'添加生成任务并报价',exact:true}).click();
-  const request=await page.evaluate(()=>window.__calls.filter(v=>v[0]==='workbench_video_create').at(-1));
-  assert.equal(request[3].model,'seedance_2.5');assert.equal(request[3].resolution,'1080p');
-  assert.equal(request[4],'baseline');
-  assert.equal('use_context_ir' in request[3],false);
+  await page.getByText(/已创建 1 组/).waitFor();
+  const request=await page.evaluate(()=>window.__calls.filter(v=>v[0]==='workbench_video_create_batch').at(-1));
+  assert.equal(request[2].model,'seedance_2.5');assert.equal(request[2].resolution,'1080p');
+  assert.equal(request[3],'baseline');
+  assert.equal('use_context_ir' in request[2],false);
   await page.setViewportSize({width:1100,height:700});
   assert.ok(await page.locator('.main-content').evaluate(el=>el.scrollWidth-el.clientWidth<=1));
   await page.screenshot({path:path.resolve(__dirname,'../../validation/video-studio-independent.png')});
   await page.setViewportSize({width:1560,height:920});
   await page.evaluate(()=>{window.__agentBusy=false;});
-  await page.getByRole('button',{name:'我的任务 TASKS',exact:true}).click();
+  await page.getByRole('button',{name:'我的任务',exact:true}).click();
   await page.locator('.task-row').first().waitFor();
   assert.equal(await page.locator('.task-row').count(),4);
   assert.equal(await page.getByLabel('当前项目',{exact:true}).count(),0);
@@ -314,7 +330,7 @@ const assert = require("node:assert/strict");
   assert.equal(await page.evaluate(()=>window.__calls.filter(v=>v[0]==='workbench_video_approve').length),1);
   await page.setViewportSize({width:1560,height:920});
   console.log('PASS: My Tasks includes history, pending downloads, per-clip details and playback; filters span projects; viewing never retries or submits');
-  await page.getByRole('button',{name:'后期制作 04',exact:true}).click();
+  await page.getByRole('button',{name:'后期制作',exact:true}).click();
   await page.locator('.table-row input[type=checkbox]').first().check();
   await page.getByRole("button", { name: "开始 / 继续后期" }).click();
   assert.deepEqual(
@@ -336,7 +352,7 @@ const assert = require("node:assert/strict");
   assert.equal(edit[1][0], "post1");
   assert.equal(edit[2], false);
   assert.equal(edit[3].revision, "rev1");
-  await page.getByRole("button", { name: "成片库 05", exact: true }).click();
+  await page.getByRole("button", { name: "成片库", exact: true }).click();
   assert.equal(await page.getByText("已导出", { exact: true }).count(), 1);
   await page.getByRole("button", { name: "标记验收" }).click();
   await page.getByRole("button", { name: "撤销验收" }).waitFor();
@@ -357,7 +373,7 @@ const assert = require("node:assert/strict");
   });
   await page.setViewportSize({ width: 1560, height: 920 });
   await page.getByRole("button", { name: "收起助手" }).click();
-  await page.getByRole("button", {name: "项目 01", exact: true}).click();
+  await page.getByRole("button", {name: "导入与拆解", exact: true}).click();
   await page.screenshot({
     path: path.resolve(__dirname, "../../validation/workbench-projects.png"),
   });
@@ -375,7 +391,7 @@ const assert = require("node:assert/strict");
     "PASS: five pages, preserved prompt, Context-IR, exact fee confirmation, exact post scope, caption version, review state, Agent panel, 1100px layout",
   );
   await page.getByRole('button', {name: '收起助手'}).click();
-  await page.getByRole('button', {name: '项目 01', exact: true}).click();
+  await page.getByRole('button', {name: '导入与拆解', exact: true}).click();
   await page.locator('.main-content').evaluate(el => el.scrollTo({top: el.scrollHeight}));
   await page.getByRole('button', {name: '新建项目', exact: true}).click();
   await page.locator('.analysis-source').filter({hasText: '刚导入的视频'}).waitFor();
@@ -386,7 +402,7 @@ const assert = require("node:assert/strict");
   }), 'Analysis must be visible after import in a small window with many projects');
   await analyze.click();
   assert.deepEqual(await page.evaluate(() => window.__calls.filter(v => v[0] === 'start_analysis').at(-1)), ['start_analysis', '0', '', false]);
-  await page.getByRole('button', {name: '图片组 02', exact: true}).click();
+  await page.getByRole('button', {name: '来源图片组', exact: true}).click();
   await page.getByRole('button', {name: '分析视频', exact: true}).click();
   await page.getByRole('heading', {name: '分析当前视频'}).waitFor();
   await page.screenshot({path: path.join(validation, 'analysis-entry-small.png')});
@@ -420,7 +436,7 @@ const assert = require("node:assert/strict");
   console.log('PASS: connected state requires no clicks across steps; actual disconnect exposes manual reconnect');
   await page.getByRole('button', {name: '收起助手'}).click();
   await page.evaluate(() => { window.__overviewFixtures = true; });
-  await page.getByRole('button', {name: '素材总览 ALL', exact: true}).click();
+  await page.getByRole('button', {name: '图片组总览', exact: true}).click();
   await page.getByRole('button', {name: '刷新总览', exact: true}).click();
   assert.equal(await page.locator('.overview-group').count(), 2);
   assert.equal(await page.getByLabel('当前项目', {exact: true}).count(), 0);
@@ -429,8 +445,8 @@ const assert = require("node:assert/strict");
   await page.getByLabel('搜索全部素材').fill('');
   await page.getByRole('button', {name: '选择筛选结果', exact: true}).click();
   await page.getByText('已选 2 组 · 跨 2 个项目', {exact:true}).waitFor();
-  await page.getByRole('button', {name: '项目 01', exact: true}).click();
-  await page.getByRole('button', {name: '素材总览 ALL', exact: true}).click();
+  await page.getByRole('button', {name: '导入与拆解', exact: true}).click();
+  await page.getByRole('button', {name: '图片组总览', exact: true}).click();
   await page.getByText('已选 2 组 · 跨 2 个项目', {exact:true}).waitFor();
   await page.locator('.overview-group').first().locator('.overview-shot').first().scrollIntoViewIfNeeded();
   await page.waitForFunction(() => window.__calls.some(v => v[0] === 'workbench_group_image' && v[1] === 'p1'));
@@ -449,7 +465,7 @@ const assert = require("node:assert/strict");
   await page.locator('.media-card input[type=checkbox]').check();
   await page.getByRole('button', {name:'选中 1 条送后期', exact:true}).click();
   assert.equal(await page.locator('.section-heading select').inputValue(), 'all');
-  await page.getByRole('button', {name: '素材总览 ALL', exact: true}).click();
+  await page.getByRole('button', {name: '图片组总览', exact: true}).click();
   await page.setViewportSize({width: 820, height: 520});
   assert.ok(await page.locator('.main-content').evaluate(el => el.scrollWidth <= el.clientWidth + 1));
   await page.setViewportSize({width: 1440, height: 900});
@@ -474,21 +490,21 @@ const assert = require("node:assert/strict");
   assert.deepEqual(errors, []);
   console.log('PASS: generation defaults to assembly, optional source parts, combined output post handoff, Aliyun caption flow');
   // A global card carries its explicit source into the independent form, even while Agent is busy.
-  await page.getByRole('button', {name:'素材总览 ALL',exact:true}).click();
+  await page.getByRole('button', {name:'图片组总览',exact:true}).click();
   await page.getByRole('tab', {name:'全部图片组',exact:true}).click();
   const before = await page.evaluate(()=>window.__calls.length);
   await page.evaluate(()=>{window.__agentBusy=true;});
-  await page.locator('.overview-group').filter({hasText:'另一集'}).getByRole('button',{name:'生成视频',exact:true}).click();
+  await page.locator('.overview-group').filter({hasText:'另一集'}).getByRole('button',{name:'仅生成本组',exact:true}).click();
   await page.getByLabel('提交提示词').waitFor();
   assert.equal(await page.getByLabel('素材来源',{exact:true}).inputValue(),'other');
   assert.equal(await page.locator('.video-source input').isChecked(),true);
   await page.getByRole('button',{name:'添加生成任务并报价',exact:true}).click();
-  const handoff = await page.evaluate(()=>window.__calls.filter(c=>c[0]==='workbench_video_create').at(-1));
-  assert.equal(handoff[1],'other');assert.deepEqual(handoff[2],['g1']);
+  const handoff = await page.evaluate(()=>window.__calls.filter(c=>c[0]==='workbench_video_create_batch').at(-1));
+  assert.deepEqual(handoff[1],[{project_id:'other',group_id:'g1'}]);
   assert.equal(await page.evaluate(n=>window.__calls.slice(n).filter(c=>['select_project','workbench_enter_generation','agent_send','workbench_video_approve'].includes(c[0])).length,before),0);
-  await page.getByRole('button',{name:'素材总览 ALL',exact:true}).click();
+  await page.getByRole('button',{name:'图片组总览',exact:true}).click();
   await page.getByRole('button',{name:'查看第一集第1组',exact:true}).click();
-  await page.getByRole('dialog').getByRole('button',{name:'生成视频',exact:true}).click();
+  await page.getByRole('dialog').getByRole('button',{name:'仅生成本组',exact:true}).click();
   await page.getByLabel('提交提示词').waitFor();
   assert.equal(await page.getByLabel('素材来源',{exact:true}).inputValue(),'p1');
   console.log('PASS: overview card and detail hand off exact cross-project selection while Agent runs; no implicit submission');
@@ -501,7 +517,7 @@ const assert = require("node:assert/strict");
   await page.getByText(/素材来源加载失败：.*测试来源读取失败/).waitFor();
   assert.equal(await page.getByRole('button',{name:'添加生成任务并报价',exact:true}).isEnabled(),false);
   await page.evaluate(()=>{window.__failApi={workbench_post_settings:'测试后期配置失败'};});
-  await page.getByRole('button',{name:'后期制作 04',exact:true}).click();
+  await page.getByRole('button',{name:'后期制作',exact:true}).click();
   await page.getByText(/后期配置加载失败：.*测试后期配置失败/).waitFor();
   assert.equal(await page.getByRole('button',{name:'开始 / 继续后期',exact:true}).isEnabled(),false);
   await page.evaluate(()=>{window.__failApi={};});
@@ -511,14 +527,14 @@ const assert = require("node:assert/strict");
 
   // Full reload clears the saved form, exercising the initial configuration failure.
   await page.reload();
-  await page.getByRole('heading',{name:'项目',exact:true}).waitFor();
+  await page.getByRole('heading',{name:'图片组总览',exact:true}).waitFor();
   await page.evaluate(()=>{window.__failApi={workbench_video_preset:'测试配置读取失败'};});
-  await page.getByRole('button',{name:'视频生成 03',exact:true}).click();
+  await page.getByRole('button',{name:'视频生成',exact:true}).click();
   await page.getByText(/生成配置加载失败：.*测试配置读取失败/).waitFor();
   await page.evaluate(()=>{window.__failApi={};});
   await page.getByRole('button',{name:'重试生成配置',exact:true}).click();
   await page.getByLabel('提交提示词').waitFor();
-  await page.getByRole('button',{name:'图片组 02',exact:true}).click();
+  await page.getByRole('button',{name:'来源图片组',exact:true}).click();
   await page.evaluate(()=>{window.__failApi={workbench_group_image:'测试图片读取失败'};});
   await page.getByRole('button',{name:'去生成',exact:true}).click();
   await page.getByRole('button',{name:'重试图片 A',exact:true}).waitFor();
@@ -528,6 +544,65 @@ const assert = require("node:assert/strict");
   assert.deepEqual(await page.evaluate(()=>window.__unexpectedCalls || []),[]);
   assert.deepEqual(errors,[]);
   console.log('PASS: failed preset/source/image/status/post reads show actionable errors and retry successfully');
+  // Reproduce the reported bug through the actual overview selection and creation controls.
+  await page.getByRole('button',{name:'图片组总览',exact:true}).click();
+  await page.getByRole('button',{name:'选择筛选结果',exact:true}).click();
+  await page.getByRole('button',{name:'生成所选 2 组视频',exact:true}).click();
+  await page.getByText('本次生成：2 组 · 2 个来源',{exact:true}).waitFor();
+  assert.equal(await page.locator('.batch-source').count(),2);
+  const batchBefore=await page.evaluate(()=>window.__calls.length);
+  await page.getByRole('button',{name:'我的任务',exact:true}).click();
+  await page.getByRole('button',{name:'视频生成',exact:true}).click();
+  await page.getByText('本次生成：2 组 · 2 个来源',{exact:true}).waitFor();
+  await page.getByLabel('素材来源',{exact:true}).selectOption('other');
+  assert.equal(await page.locator('.video-source input').isChecked(),true);
+  await page.getByRole('button',{name:'使用成功模板',exact:true}).click();
+  await page.setViewportSize({width:820,height:620});
+  assert.ok(await page.locator('.main-content').evaluate(el=>el.scrollWidth<=el.clientWidth+1));
+  await page.screenshot({path:path.join(validation,'batch-generation-scope.png')});
+  await page.getByRole('button',{name:'添加生成任务并报价',exact:true}).click();
+  await page.getByText('已创建 2 组、2 条任务；未完成 0 组。请在下方核对费用，尚未提交付费生成。',{exact:true}).waitFor();
+  const batchCall=await page.evaluate(n=>window.__calls.slice(n).find(c=>c[0]==='workbench_video_create_batch'),batchBefore);
+  assert.deepEqual(batchCall[1],[{project_id:'p1',group_id:'g1'},{project_id:'other',group_id:'g1'}]);
+  assert.equal(batchCall[2].use_context_ir,true);
+  assert.equal(await page.getByRole('button',{name:'添加生成任务并报价',exact:true}).isEnabled(),false);
+  assert.equal(await page.evaluate(n=>window.__calls.slice(n).filter(c=>['select_project','workbench_video_approve','workbench_video_approve_batch','workbench_start_post'].includes(c[0])).length,batchBefore),0);
+  // Partial failure retains only the failed source for an explicit retry.
+  await page.getByRole('button',{name:'图片组总览',exact:true}).click();
+  await page.getByRole('button',{name:'生成所选 2 组视频',exact:true}).click();
+  await page.evaluate(()=>{window.__failGroup='p1';});
+  await page.getByRole('button',{name:'添加生成任务并报价',exact:true}).click();
+  await page.getByText(/已创建 1 组、1 条任务；未完成 1 组/).waitFor();
+  await page.getByText('本次生成：1 组 · 1 个来源',{exact:true}).waitFor();
+  assert.equal(await page.locator('.batch-source').count(),1);
+  assert.ok((await page.locator('.batch-source').textContent()).includes('素材项目'));
+  await page.evaluate(()=>{delete window.__failGroup;});
+  await page.getByRole('button',{name:'添加生成任务并报价',exact:true}).click();
+  await page.getByText(/已创建 1 组、1 条任务；未完成 0 组/).waitFor();
+  await page.getByRole('button',{name:'选择可提交任务',exact:true}).click();
+  await page.getByRole('button',{name:/核对所选费用/}).click();
+  await page.getByRole('region',{name:'批量费用确认'}).waitFor();
+  await page.getByRole('button',{name:'取消',exact:true}).click();
+  assert.equal(await page.evaluate(n=>window.__calls.slice(n).filter(c=>c[0]==='workbench_video_approve_batch').length,batchBefore),0);
+  // Recycle and restore remain available without switching the current project.
+  await page.getByRole('button',{name:'图片组总览',exact:true}).click();
+  await page.getByRole('button',{name:'移入回收站',exact:true}).click();
+  await page.getByRole('dialog').getByRole('button',{name:'确认操作',exact:true}).click();
+  await page.getByText('成功 2 组，失败 0 组',{exact:true}).waitFor();
+  assert.equal(await page.locator('.overview-group').count(),0);
+  await page.getByLabel('素材状态筛选').selectOption('trash');
+  assert.equal(await page.locator('.overview-group').count(),2);
+  await page.getByRole('button',{name:'选择筛选结果',exact:true}).click();
+  await page.getByRole('button',{name:'恢复所选图片组',exact:true}).click();
+  await page.getByRole('dialog').getByRole('button',{name:'确认操作',exact:true}).click();
+  await page.getByRole('dialog').waitFor({state:'hidden'});
+  await page.getByLabel('素材状态筛选').selectOption('all');
+  assert.equal(await page.locator('.overview-group').count(),2);
+  await page.getByRole('button',{name:'选择筛选结果',exact:true}).click();
+  await page.screenshot({path:path.join(validation,'batch-overview-compact.png')});
+  assert.deepEqual(errors,[]);
+  assert.deepEqual(await page.evaluate(()=>window.__unexpectedCalls || []),[]);
+  console.log('PASS: cross-project batch handoff, repeated group IDs, saved scope, partial failure retry, exact payment preview, reversible deletion and compact UI');
   await browser.close();
 })().catch(async (e) => {
   console.error(e);

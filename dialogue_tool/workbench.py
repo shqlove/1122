@@ -43,7 +43,10 @@ def save_json(path, value):
         tmp.unlink(missing_ok=True)
 
 
-class WorkbenchMixin:
+from .batch_workbench import BatchWorkbenchMixin, trash_records, group_key
+
+
+class WorkbenchMixin(BatchWorkbenchMixin):
     def _video_jobs(self):
         from .video_queue import queue_for
         with self.lock:
@@ -52,10 +55,11 @@ class WorkbenchMixin:
             return self._video_queue
 
     def workbench_video_sources(self):
+        trash = trash_records(self._service)
         return [{'id': p['id'], 'name': p['name'], 'groups': [
             {'id': g['id'], 'number': i, 'needs_review': bool(g.get('needs_review')),
              'voice': g.get('generation_bindings', {}).get('voice_name'),
-             'selected': g.get('selected', False)} for i, g in enumerate(p.get('groups', []), 1)]}
+             'selected': g.get('selected', False)} for i, g in enumerate(p.get('groups', []), 1) if group_key(p['id'], g['id']) not in trash]}
             for p in self._service.projects.list()]
 
     def workbench_video_preset(self):
@@ -80,8 +84,8 @@ class WorkbenchMixin:
                            'ratios': flags['--ratio']['values'], 'resolutions': flags['--resolution']['values']})
         return result
 
-    def workbench_video_create(self, project_id, group_ids, config, voice_source='baseline'):
-        return self._video_jobs().create(project_id, group_ids, config, voice_source)
+    def workbench_video_create(self, project_id, group_ids, config, voice_source='baseline', creation_id=None):
+        return self._video_jobs().create(project_id, group_ids, config, voice_source, creation_id)
 
     def workbench_video_jobs(self):
         from .media_server import MediaServer
@@ -317,6 +321,11 @@ class WorkbenchMixin:
                 runs.append(run)
             except (OSError, ValueError):
                 pass
+        trash = trash_records(self._service)
+        for g in all_groups:
+            g['trashed'] = group_key(g['project_id'], g['group_id']) in trash
+        for item in items:
+            item['trashed'] = 'media:' + item['id'] in trash
         items.sort(key=lambda i: i.get('created_at') or 0, reverse=True)
         return {'items': items, 'projects': projects, 'groups': all_groups, 'runs': sorted(runs, key=lambda r: r.get('started_at', 0), reverse=True),
                 'post_available': (self._post_root() / 'postprocess.py').is_file()}
@@ -482,6 +491,8 @@ class WorkbenchMixin:
             allowed = Path(cfg['inputRoot']).resolve()
             for key in item_ids:
                 item = known[key]
+                if item.get('trashed'):
+                    raise ValueError('所选视频已移入回收站，请先恢复')
                 source = item.get('source_path') if item['kind'] == 'post' else item.get('archive_path')
                 if item['kind'] == 'assembly' and item.get('available'):
                     from .video_archive import digest

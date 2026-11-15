@@ -11,22 +11,30 @@ const h3 = {model:'MiniMax-H3', label:'MiniMax H3', min:4, max:30,
 const names: any = {preparing:'正在准备 / 报价',needs_review:'待检查参考图',awaiting_approval:'待确认费用',
   submitting:'提交中',tracking:'跟踪原任务',downloaded:'已下载',attention:'待处理'};
 let saved: any = null;
-export function selectVideoSource(pid:string, gids:string[]) {saved={...saved,pid,gids};}
+export type VideoSource = {project_id:string; group_id:string};
+export function selectVideoSources(selection:VideoSource[]) {saved={...saved,pid:selection[0]?.project_id || '',selection};}
+export function selectVideoSource(pid:string, gids:string[]) {selectVideoSources(gids.map(group_id=>({project_id:pid,group_id})));}
 
 function SourceImage({pid,gid,side}: any) {
   const [src,setSrc] = useState(''), [error,setError] = useState(''), [attempt,setAttempt] = useState(0);
+  const container=useRef<HTMLDivElement>(null), [visible,setVisible]=useState(false);
+  useEffect(()=>{const observer=new IntersectionObserver(entries=>{if(entries.some(e=>e.isIntersecting)){setVisible(true);observer.disconnect();}},{rootMargin:'160px'});if(container.current)observer.observe(container.current);return()=>observer.disconnect();},[]);
   useEffect(()=> {
+    if(!visible)return;
     let live=true; setSrc(''); setError('');
     api('workbench_group_image',pid,gid,side).then(v=>{if(live)setSrc(v.url);}).catch(e=>{if(live)setError(String(e));});
     return()=>{live=false;};
-  },[pid,gid,side,attempt]);
-  return <div style={{width:'48%'}}>{error ? <div className="notice error" role="alert">参考图 {side.toUpperCase()} 加载失败：{error}<Button size="sm" variant="outline" onClick={()=>setAttempt(v=>v+1)}>重试图片 {side.toUpperCase()}</Button></div> : src ? <img src={src} onError={()=>setError('图片文件无法显示')} alt={`参考图 ${side.toUpperCase()}`} style={{width:'100%',borderRadius:8}}/> : <p className="muted">正在读取参考图 {side.toUpperCase()}…</p>}</div>;
+  },[pid,gid,side,attempt,visible]);
+  return <div ref={container} style={{width:'48%',minHeight:70}}>{error ? <div className="notice error" role="alert">参考图 {side.toUpperCase()} 加载失败：{error}<Button size="sm" variant="outline" onClick={()=>setAttempt(v=>v+1)}>重试图片 {side.toUpperCase()}</Button></div> : src ? <img src={src} onError={()=>setError('图片文件无法显示')} alt={`参考图 ${side.toUpperCase()}`} style={{width:'100%',borderRadius:8}}/> : <p className="muted">正在读取参考图 {side.toUpperCase()}…</p>}</div>;
 }
 
 export function VideoStudio({initialProjectId,initialGroupIds,onOpenTasks}: any) {
   const [sources,setSources] = useState<any[]>([]), [models,setModels] = useState<any[]>([]);
   const [pid,setPid] = useState(saved?.pid || initialProjectId || '');
-  const [gids,setGids] = useState<string[]>(saved?.gids || initialGroupIds || []);
+  const [selection,setSelection] = useState<VideoSource[]>(saved?.selection || (initialGroupIds || []).map((group_id:string)=>({project_id:initialProjectId,group_id})));
+  const [receipt,setReceipt] = useState(''), [approvedSelection,setApprovedSelection] = useState<string[]>([]);
+  const [approval,setApproval] = useState<any[] | null>(null);
+  const request = useRef<{signature:string; id:string} | null>(saved?.request || null);
   const [form,setForm] = useState<any>(saved?.form || null), [preset,setPreset] = useState<any>(null);
   const [voiceSource,setVoiceSource] = useState(saved?.voiceSource || 'baseline');
   const [rows,setRows] = useState<any[]>([]), [error,setError] = useState(''), [modelError,setModelError] = useState('');
@@ -49,9 +57,12 @@ export function VideoStudio({initialProjectId,initialGroupIds,onOpenTasks}: any)
     loadSources(); loadPreset(); refresh(); loadModels();
     const timer = setInterval(refresh,2500); return()=>clearInterval(timer);
   },[]);
-  useEffect(()=> {saved={pid,gids,form,voiceSource};},[pid,gids,form,voiceSource]);
+  useEffect(()=> {saved={...saved,pid,selection,form,voiceSource};},[pid,selection,form,voiceSource]);
   const groups = sources.find(p=>p.id===pid)?.groups || [];
-  const validSelection = gids.length>0 && gids.every(id=>groups.some((g:any)=>g.id===id && !g.needs_review));
+  const gids = selection.filter(v=>v.project_id===pid).map(v=>v.group_id);
+  const validSelection = selection.length>0 && selection.some(v=>sources.find(p=>p.id===v.project_id)?.groups.some((g:any)=>g.id===v.group_id && !g.needs_review));
+  const scopeLabel = (v:VideoSource) => `${sources.find(p=>p.id===v.project_id)?.name || v.project_id} · 第 ${sources.find(p=>p.id===v.project_id)?.groups.find((g:any)=>g.id===v.group_id)?.number || v.group_id} 组`;
+  const removeSource = (v:VideoSource) => setSelection(all=>all.filter(x=>x.project_id!==v.project_id || x.group_id!==v.group_id));
   const isH3 = form?.model === 'MiniMax-H3';
   const capability = isH3 ? h3 : models.find(m=>m.model===form?.model);
   const locked = form?.baseline_id === 'h3-first-v1';
@@ -80,17 +91,21 @@ export function VideoStudio({initialProjectId,initialGroupIds,onOpenTasks}: any)
     {presetError && <div className="notice error" role="alert">生成配置加载失败：{presetError}<Button variant="outline" onClick={loadPreset}>重试生成配置</Button></div>}
     <Card><CardContent>
       <div className="section-heading"><h2>新建视频</h2><Badge variant="secondary">全能参考 · 图片 + 音色</Badge></div>
-      <label>素材来源<select aria-label="素材来源" value={pid} onChange={e=>{setPid(e.target.value);setGids([]);}}>
+      <label>素材来源<select aria-label="素材来源" value={pid} disabled={adding} onChange={e=>setPid(e.target.value)}>
         <option value="" disabled>选择素材项目</option>{sources.map(p=><option key={p.id} value={p.id}>{p.name}</option>)}
       </select></label>
       <Button size="sm" variant="outline" disabled={sourcesLoading} onClick={loadSources}>刷新素材来源</Button>
       {sourceError && <p className="notice error" role="alert">素材来源加载失败：{sourceError}，请刷新素材来源。</p>}
       {!sourceError && !sourcesLoading && !groups.length && <p className="notice">当前来源没有可用图片组，请在项目中完成视频分析和选图后刷新。</p>}
-      {!sourcesLoading && gids.length>0 && !validSelection && <p className="notice">所选图片组已变化或人物待确认，请到来源图片组核对后重新选择。</p>}
+      {!sourcesLoading && selection.some(v=>!sources.find(p=>p.id===v.project_id)?.groups.some((g:any)=>g.id===v.group_id && !g.needs_review)) && <p className="notice">部分图片组已变化或人物待确认；可用组会独立创建，其余组将列出原因。</p>}
       <div className="video-source-grid">{groups.map((g:any)=><label key={g.id} className="video-source">
-        <span><input type="checkbox" disabled={g.needs_review} checked={gids.includes(g.id)} onChange={e=>setGids(ids=>e.target.checked?[...ids,g.id]:ids.filter(id=>id!==g.id))}/> 第 {g.number} 组 {g.needs_review && '· 人物待确认'}</span>
-        {gids.includes(g.id) && <div className="row"><SourceImage pid={pid} gid={g.id} side="a"/><SourceImage pid={pid} gid={g.id} side="b"/></div>}
+        <span><input type="checkbox" disabled={adding || g.needs_review} checked={gids.includes(g.id)} onChange={e=>e.target.checked?setSelection(all=>[...all,{project_id:pid,group_id:g.id}]):removeSource({project_id:pid,group_id:g.id})}/> 第 {g.number} 组 {g.needs_review && '· 人物待确认'}</span>
       </label>)}</div>
+      <section className="batch-scope" aria-label="本次生成范围">
+        <div className="section-heading wrap"><h3>本次生成：{selection.length} 组 · {new Set(selection.map(v=>v.project_id)).size} 个来源</h3><Button size="sm" variant="ghost" disabled={adding || !selection.length} onClick={()=>setSelection([])}>清空生成范围</Button></div>
+        <p className="muted">切换素材来源可继续添加，不会清空已选组。每组独立绑定 A/B 图片；长台词两段完成后合并为一个原片。</p>
+        <div className="batch-source-list">{selection.map(v=><div className="batch-source" key={JSON.stringify(v)}><div className="row between"><strong>{scopeLabel(v)}</strong><Button size="sm" variant="ghost" disabled={adding} onClick={()=>removeSource(v)}>移除</Button></div><div className="row"><SourceImage pid={v.project_id} gid={v.group_id} side="a"/><SourceImage pid={v.project_id} gid={v.group_id} side="b"/></div></div>)}</div>
+      </section>
       <div className="row" style={{flexWrap:'wrap',margin:'16px 0'}}>
         <Button disabled={!preset} variant={locked?'secondary':'outline'} onClick={()=>{setForm(preset);setVoiceSource('baseline');}}>使用成功模板</Button>
         <Button variant={!locked?'secondary':'outline'} onClick={()=>update({baseline_id:'custom',auto_split_dialogue:false,...(isH3?{verbatim_prompt:true}:{})})}>手动配置参数</Button>
@@ -119,15 +134,44 @@ export function VideoStudio({initialProjectId,initialGroupIds,onOpenTasks}: any)
         <label>平台 Skill ID（可留空）<Input value={form.skill_id || ''} disabled={!form.use_context_ir} onChange={e=>update({skill_id:e.target.value})}/></label>
       </details>}
       <Button style={{marginTop:20}} disabled={adding || sourcesLoading || !!sourceError || !validSelection || !capability} onClick={async()=>{
-        setAdding(true);setError('');try{const result=await api('workbench_video_create',pid,gids,form,voiceSource);if(result.errors?.length)setError(result.errors.map((e:any)=>`第 ${groups.find((g:any)=>g.id===e.group_id)?.number || e.group_id} 组：${e.message}`).join('；'));await refresh();}catch(e){setError(String(e));}finally{setAdding(false);}
+        setAdding(true);setError('');setReceipt('');
+        const signature=JSON.stringify([selection,form,voiceSource]);
+        if(request.current?.signature!==signature)request.current={signature,id:crypto.randomUUID()};
+        saved={...saved,request:request.current};
+        try {
+          const result=await api('workbench_video_create_batch',selection,form,voiceSource,request.current!.id);
+          const created=result.items.filter((v:any)=>v.status==='created'), failed=result.items.filter((v:any)=>v.status!=='created');
+          setReceipt(`已创建 ${created.length} 组、${created.reduce((n:number,v:any)=>n+v.job_ids.length,0)} 条任务；未完成 ${failed.length} 组。请在下方核对费用，尚未提交付费生成。`);
+          if(failed.length)setError(failed.map((v:any)=>`${scopeLabel(v)}：${v.message}`).join('；'));
+          const handled=result.items.filter((v:any)=>v.status!=='failed');
+          const remaining=(all:VideoSource[])=>all.filter(v=>!handled.some((x:any)=>x.project_id===v.project_id && x.group_id===v.group_id));
+          setSelection(remaining);
+          if(JSON.stringify(saved?.selection)===JSON.stringify(selection))saved={...saved,selection:remaining(selection),request:null};
+          request.current=null;
+          await refresh();
+        } catch(e){setError(`创建结果未确认：${String(e)}。再次点击会核对同一请求，不会重复创建。`);} finally{setAdding(false);}
       }}>{adding?'保存素材副本…':'添加生成任务并报价'}</Button>
+      {receipt && <p className="notice" role="status">{receipt}</p>}
     </CardContent></Card>
     <div className="section-heading" style={{marginTop:24}}><h2>逐条任务记录 · {rows.length}</h2><Button variant="outline" onClick={()=>refresh().catch(e=>setError(String(e)))}>刷新记录</Button></div>
     {jobsError && <p className="notice error" role="alert">任务状态暂未更新：{jobsError}。保留上次记录，可点击刷新记录重试。</p>}
     {!jobsLoaded && !jobsError && <p className="muted">正在读取任务记录…</p>}
     {jobsLoaded && !jobsError && !rows.length && <p className="muted">添加任务后，每条视频会在这里单独显示报价和提交按钮。</p>}
+    <div className="batch-toolbar">
+      <Button variant="outline" onClick={()=>setApprovedSelection(rows.filter(r=>r.phase==='awaiting_approval' && r.card?.sufficient && !r.busy).map(r=>r.id))}>选择可提交任务</Button>
+      <Button variant="ghost" onClick={()=>setApprovedSelection([])}>清空任务选择</Button>
+      <Button disabled={!approvedSelection.length || !!pending.batch} onClick={()=>setApproval(rows.filter(r=>approvedSelection.includes(r.id) && r.phase==='awaiting_approval' && !r.busy).map(r=>({job_id:r.id,card_id:r.card.id,ceiling:r.card.ceiling,provider:r.card.provider,label:`${r.source_project_name} · 第 ${r.group_number} 组 · 第 ${r.part} 段`})))}>核对所选费用 · {approvedSelection.length} 条</Button>
+    </div>
+    {approval && <div className="approval batch-scope" role="region" aria-label="批量费用确认">
+      <h3>确认本次提交 · {approval.length} 条</h3>
+      {approval.map(c=><p key={c.job_id}>{c.label} · {c.ceiling} 积分上限</p>)}
+      {[...new Set(approval.map(c=>c.provider))].map(provider=><p key={provider}><strong>{provider==='compshare'?'优云智算 H3':'即梦'}：合计 {approval.filter(c=>c.provider===provider).reduce((n,c)=>n+c.ceiling,0)} 积分上限</strong></p>)}
+      <Button disabled={!approval.length || !!pending.batch} onClick={()=>action('batch',async()=>{const result=await api('workbench_video_approve_batch',approval.map(({job_id,card_id,ceiling})=>({job_id,card_id,ceiling})));setApproval(null);setApprovedSelection([]);const failed=result.filter((r:any)=>!r.ok);if(failed.length)setError(failed.map((r:any)=>`${r.id}：${r.message}`).join('；'));})}>确认费用并提交这 {approval.length} 条</Button>
+      <Button variant="outline" disabled={!!pending.batch} onClick={()=>setApproval(null)}>取消</Button>
+    </div>}
     {rows.map(row=><Card key={row.id}><CardContent>
-      <div className="section-heading"><h3>{row.source_project_name} · 第 {row.group_number} 组 · 第 {row.part}/{row.part_count} 段</h3><Badge variant="secondary">{names[row.phase] || row.phase}</Badge></div>
+      {row.phase==='awaiting_approval' && <label className="check-label"><input type="checkbox" aria-label={`选择任务 ${row.id}`} disabled={row.busy || !row.card?.sufficient} checked={approvedSelection.includes(row.id)} onChange={e=>setApprovedSelection(ids=>e.target.checked?[...ids,row.id]:ids.filter(id=>id!==row.id))}/>加入批量提交</label>}
+      <div className="section-heading"><h3>{row.source_project_name} · 第 {row.group_number} 组 · 第 {row.part}/{row.part_count} 段</h3><Badge variant="secondary">{row.queued?'等待处理槽位':names[row.phase] || row.phase}</Badge></div>
       <p>{row.model} · {row.duration} 秒 · {row.ratio} · {row.resolution} {row.task_status && `· ${row.task_status}`}</p>
       <small className="muted">记录 {row.id.slice(0,8)}{row.submit_id && ` · 提交 ID ${row.submit_id}`}</small>
       {(row.error || row.task_error) && <p className="notice error">{row.error || (typeof row.task_error==='string'?row.task_error:JSON.stringify(row.task_error))}</p>}

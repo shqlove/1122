@@ -40,7 +40,7 @@ import {
   DialogDescription,
 } from "@/components/ui/dialog";
 import { api, backendReady } from "./lib/api";
-import { VideoStudio, selectVideoSource } from "./VideoStudio";
+import { VideoStudio, selectVideoSource, selectVideoSources } from "./VideoStudio";
 import { MyTasks } from "./MyTasks";
 
 const Context = createContext<any>(null);
@@ -77,13 +77,14 @@ function Poster({ item }: any) {
   );
 }
 const pages = [
-  ["overview", "素材总览", Library],
-  ["projects", "项目", FolderOpen],
-  ["groups", "图片组", Images],
+  ["overview", "图片组总览", Images],
   ["generate", "视频生成", Clapperboard],
   ["tasks", "我的任务", Clock],
+  ["raw", "原片库", Film],
   ["post", "后期制作", AudioLines],
   ["library", "成片库", Library],
+  ["projects", "导入与拆解", FolderOpen],
+  ["groups", "来源图片组", FolderOpen],
 ] as const;
 const statusNames: any = {
   downloaded: "已下载",
@@ -220,7 +221,7 @@ export default function App() {
   const [state, setState] = useState<any>({ projects: [] }),
     [lib, setLib] = useState<any>({ items: [], projects: [], runs: [] }),
     [agent, setAgent] = useState<any>({ messages: [] }),
-    [page, setPage] = useState("projects"),
+    [page, setPage] = useState("overview"),
     [panel, setPanel] = useState(false),
     [notice, setNotice] = useState(""),
     [working, setWorking] = useState(false),
@@ -337,6 +338,7 @@ export default function App() {
     goPost,
     setNotice,
     startVideo: (pid: string, gids: string[]) => {selectVideoSource(pid, gids); setPage("generate");},
+    startVideos: (scope: any[]) => {selectVideoSources(scope.map(({project_id,group_id})=>({project_id,group_id}))); setPage("generate");},
     overview, setOverview,
     goSource: async (item: any, targetPage = "groups") => {
       await act(async () => {
@@ -365,11 +367,11 @@ export default function App() {
               <button
                 key={id}
                 className={page === id ? "nav-item active" : "nav-item"}
-                onClick={() => setPage(id)}
+                onClick={() => {if(id==="overview" || id==="raw")setOverview((v:any)=>({...v,tab:id==="raw"?"videos":"groups",filter:"all"}));setPage(id);}}
               >
                 <Icon size={19} />
                 {label}
-                <small>{{overview:'ALL',projects:'01',groups:'02',generate:'03',tasks:'TASKS',post:'04',library:'05'}[id]}</small>
+
               </button>
             ))}
           </nav>
@@ -395,7 +397,7 @@ export default function App() {
               <strong>{name}</strong>
             </div>
             <div className="top-actions">
-              {["overview", "generate", "tasks"].includes(page) ? <Badge variant="secondary">{page === "generate" ? "独立视频任务" : page === "tasks" ? "全部项目 · 提交记录" : "全部项目 · 素材总览"}</Badge> : <Select
+              {["overview", "raw", "generate", "tasks", "post", "library"].includes(page) ? <Badge variant="secondary">{page === "generate" ? "独立视频任务" : page === "tasks" ? "全部项目 · 提交记录" : "全部项目 · 素材总览"}</Badge> : <Select
                 aria-label="当前项目"
                 value={p?.id || ""}
                 disabled={working || state.navigation_busy}
@@ -422,12 +424,13 @@ export default function App() {
             </div>
           </header>
           <div className="body-row">
-            <main className="main-content" ref={mainRef}>
+            <main className={["overview","raw"].includes(page)?"main-content overview-main":"main-content"} ref={mainRef}>
               <div className="page-heading">
                 <div className="eyebrow">
                   {page === "settings"
                     ? "WORKSPACE SETTINGS"
                     : page === "overview" ? "ALL PROJECTS / 素材总览"
+                    : page === "raw" ? "ORIGINAL VIDEOS / 原片库"
                     : page === "tasks" ? "TASK HISTORY / 全部提交"
                     : `WORKFLOW / ${{projects:'01',groups:'02',generate:'03',post:'04',library:'05'}[page]}`}
                 </div>
@@ -435,7 +438,8 @@ export default function App() {
                 <p>
                   {
                     {
-                      overview: "所有集数的图片组和生成视频，集中浏览、筛选与对比。",
+                      overview: "跨来源筛选图片组，确认素材并批量生成。",
+                      raw: "检查完整原片，批量选择后开始后期。",
                       projects:
                         "从一段素材开始，让每一组对话都有完整的制作记录。",
                       groups: "选择画面、确认人物，让豪哥始终站在故事中心。",
@@ -469,7 +473,7 @@ export default function App() {
                   <progress max="1" value={state.progress || 0} />
                 </div>
               )}
-              {page === "overview" ? (
+              {["overview", "raw"].includes(page) ? (
                 <Overview />
               ) : page === "projects" ? (
                 <Projects />
@@ -559,17 +563,21 @@ function HistoryReference({ itemId, reference }: any) {
 }
 
 function Overview() {
-  const { lib, overview: view, setOverview, goSource, goPost, act, busy, agent, setPanel, refresh, startVideo } = useApp();
+  const { lib, overview: view, setOverview, goSource, goPost, act, busy, agent, setPanel, refresh, startVideo, startVideos } = useApp();
+  const [batchAction,setBatchAction] = useState<string | null>(null), [batchResult,setBatchResult] = useState("");
+  const [operating,setOperating] = useState(false);
   const [detail, setDetail] = useState<any>(null), [imageDetail, setImageDetail] = useState<any>(null);
   const change = (values: any) => setOverview((old: any) => ({...old, ...values, limit: values.limit || 24}));
-  const groups = lib.groups || [];
-  const videos = lib.items.filter((v: any) => ["generation", "assembly"].includes(v.kind) && ["downloaded", "completed"].includes(v.status));
+  const allGroups = lib.groups || [];
+  const groups = allGroups.filter((g:any)=>view.filter==="trash" ? g.trashed : !g.trashed);
+  const videos = lib.items.filter((v: any) => ["generation", "assembly"].includes(v.kind) && ["downloaded", "completed"].includes(v.status) && (view.filter==="trash"?v.trashed:!v.trashed));
   const matches = (v: any) => (view.project === "all" || v.project_id === view.project) &&
     `${v.project_name} ${v.group_number} ${v.person_a || ""} ${v.person_b || ""} ${v.submit_id || ""}`.toLowerCase().includes(view.search.trim().toLowerCase());
-  const filteredGroups = groups.filter((g: any) => matches(g) && (view.filter === "all" ||
+  const filteredGroups = groups.filter((g: any) => matches(g) && (view.filter === "all" || view.filter === "trash" ||
+    (view.filter === "ready" && !g.needs_review && g.clean_reviewed) ||
     (view.filter === "generated" && g.generated > 0) || (view.filter === "unmade" && !g.generated) ||
     (view.filter === "review" && g.needs_review) || (view.filter === "clean" && g.clean_reviewed)));
-  const filteredVideos = videos.filter((v: any) => matches(v) && (view.filter === "all" ||
+  const filteredVideos = videos.filter((v: any) => (view.filter === "single" || view.filter === "trash" || !v.assembly_id) && matches(v) && (view.filter === "all" || view.filter === "trash" ||
     (view.filter === "single" && v.kind === "generation") || (view.filter === "assembly" && v.kind === "assembly") ||
     (view.filter === "ir_on" && v.context_ir === true) || (view.filter === "ir_off" && v.context_ir === false)));
   const pickedGroups = groups.filter((g: any) => view.picked.includes(g.id));
@@ -577,7 +585,7 @@ function Overview() {
   const prepareScope = async (pid: string, clean = false) => {
     const selected = pickedGroups.filter((g: any) => g.project_id === pid);
     const ids = selected.map((g: any) => g.group_id);
-    if (!clean) {startVideo(pid, ids); return;}
+    if (!clean) {startVideos(pickedGroups); return;}
     await act(async () => {
       await api("workbench_select_global_groups", pid, ids);
       await api("select_project", pid);
@@ -605,9 +613,9 @@ function Overview() {
       <Select aria-label="素材项目筛选" value={view.project} onChange={(e: any) => change({project: e.target.value})}>
         <option value="all">全部项目</option>{lib.projects.map((p: any) => <option key={p.id} value={p.id}>{p.name}</option>)}
       </Select>
-      <Select aria-label="素材状态筛选" value={view.filter} onChange={(e: any) => change({filter: e.target.value})}>
-        <option value="all">全部状态</option>
-        {view.tab === "groups" ? <><option value="generated">已生成过视频</option><option value="unmade">尚未生成</option><option value="review">人物待确认</option><option value="clean">清理检查已通过</option></> :
+      <Select aria-label="素材状态筛选" value={view.filter} onChange={(e: any) => change({filter: e.target.value, ...((e.target.value==="trash")!==(view.filter==="trash")?{picked:[],videos:[]}: {})})}>
+        <option value="all">全部状态</option><option value="trash">回收站</option>
+        {view.tab === "groups" ? <><option value="ready">可生成</option><option value="generated">已生成过视频</option><option value="unmade">尚未生成</option><option value="review">人物待确认</option><option value="clean">清理检查已通过</option></> :
           <><option value="single">分段 / 单条原片</option><option value="assembly">完整拼接视频</option><option value="ir_on">Context-IR 开启</option><option value="ir_off">Context-IR 关闭</option></>}
       </Select>
     </div>
@@ -616,14 +624,22 @@ function Overview() {
         <Button variant="outline" disabled={!filteredGroups.length} onClick={() => change({picked: [...new Set([...view.picked, ...filteredGroups.map((g: any) => g.id)])]})}>选择筛选结果</Button>
         <Button variant="ghost" disabled={!view.picked.length} onClick={() => change({picked: []})}>清空选择</Button>
         <span>已选 {pickedGroups.length} 组 · 跨 {queueProjects.length} 个项目</span>
+        {view.filter === "trash" ? <Button disabled={!pickedGroups.length || operating} onClick={()=>setBatchAction('restore')}>恢复所选图片组</Button> : <>
+          <Button disabled={!pickedGroups.length || operating} onClick={()=>startVideos(pickedGroups)}>生成所选 {pickedGroups.length} 组视频</Button>
+          <Button variant="outline" disabled={!pickedGroups.length || operating} onClick={()=>setBatchAction('confirm')}>批量确认可用</Button>
+          <Button variant="outline" disabled={!pickedGroups.length || operating || agent.busy || !agent.connected} onClick={()=>act(async()=>{await api('agent_send_global','请逐组检查本次范围，去除水印和叠加字幕，修复后复看并记录 SHA 检查。没有则跳过。不生成视频，不修改提示词和音色。某组失败继续其他组，最后汇总。',agent.model || '',agent.effort || 'low',pickedGroups);setPanel(true);})}>批量去水印 / 字幕</Button>
+          <Button variant="ghost" disabled={!pickedGroups.length || operating} onClick={()=>setBatchAction('trash')}>移入回收站</Button>
+        </>}
+
       </div>
-      {!!queueProjects.length && <Card className="overview-queue"><CardContent><h3>所选图片组 · 按来源项目处理</h3><p className="muted">跨集选择保留在总览中。进入独立视频生成页选择模板与参数，每条任务分别核对费用。</p>
+      {batchResult && <p className="notice" role="status">{batchResult}</p>}
+      {!!queueProjects.length && view.filter!=="trash" && <details className="overview-queue"><summary>查看所选来源 · {pickedGroups.length} 组 / {queueProjects.length} 个来源</summary><Card><CardContent><p className="muted">筛选或翻页不会清空勾选；生成所选组时统一带入下列全部来源。</p>
         {queueProjects.map(pid => <div className="overview-queue-row" key={pid}>
           <span>{pickedGroups.find((g: any) => g.project_id === pid).project_name}<small>{pickedGroups.filter((g: any) => g.project_id === pid).map((g: any) => `第${g.group_number}组`).join("、")}</small></span>
           <div className="row wrap"><Button variant="outline" disabled={busy || agent.busy || !agent.connected} onClick={() => prepareScope(pid, true)}>助手清理字幕 / 水印</Button>
-          <Button onClick={() => prepareScope(pid)}>去准备生成</Button></div>
+</div>
         </div>)}
-      </CardContent></Card>}
+      </CardContent></Card></details>}
       <div className="section-heading"><h2>图片组 <span>{filteredGroups.length} 组</span></h2></div>
       <div className="overview-grid">{filteredGroups.slice(0, view.limit).map((g: any) => <Card key={g.id} className="overview-group">
         <button className="overview-pair" onClick={() => setImageDetail(g)} aria-label={`查看${g.project_name}第${g.group_number}组`}><GlobalShot item={g} side="a" /><GlobalShot item={g} side="b" /></button>
@@ -631,20 +647,26 @@ function Overview() {
           <p className="clamp" title={g.project_name}>{g.project_name}</p><p className="clamp">A：{g.person_a || "待确认"} · B：{g.person_b || "待确认"}</p>
           <div className="row wrap"><Badge variant="outline">{g.clean_reviewed ? "清理检查通过" : g.repaired_a || g.repaired_b ? "已有修复图" : "原图 · 待清理检查"}</Badge>{g.needs_review && <Badge variant="outline">人物待确认</Badge>}</div>
           <div className="row wrap" style={{marginTop:12}}>
-            <Button onClick={() => startVideo(g.project_id, [g.group_id])}><Clapperboard size={15} />生成视频</Button>
+            <Button disabled={g.trashed} onClick={() => startVideo(g.project_id, [g.group_id])}><Clapperboard size={15} />仅生成本组</Button>
             <Button variant="ghost" onClick={() => goSource(g)}>查看来源图片组 <ArrowRight size={14} /></Button>
           </div>
         </CardContent></Card>)}</div>
     </> : <>
       <div className="section-heading wrap"><h2>生成视频 <span>{filteredVideos.length} 条</span></h2><div className="row wrap">
         <Button variant="ghost" onClick={() => change({videos: []})}>清空选择</Button>
-        <Button disabled={!view.videos.length} onClick={() => goPost(view.videos)}>选中 {view.videos.length} 条送后期</Button>
+        <Button disabled={!view.videos.length || view.filter==="trash"} onClick={() => goPost(view.videos)}>选中 {view.videos.length} 条送后期</Button>
       </div></div>
+      <BatchMediaActions ids={view.videos} clear={()=>change({videos:[]})} trash={view.filter==="trash"}/>
       <MediaGrid items={filteredVideos.slice(0, view.limit)} picked={view.videos} setPicked={(videos: string[]) => change({videos})} sourceLinks onDetails={setDetail} />
     </>}
     {!list.length && view.tab === "groups" && <Empty title="没有符合条件的图片组" body="调整筛选条件，或在项目中完成视频拆解。" />}
     {list.length > view.limit && <Button className="overview-more" variant="outline" onClick={() => change({limit: view.limit + 24})}>加载更多 · 已显示 {view.limit} / {list.length}</Button>}
-    {imageDetail && <Modal title={`${imageDetail.project_name} · 第${imageDetail.group_number}组`} onClose={() => setImageDetail(null)} wide><div className="overview-pair"><GlobalShot item={imageDetail} side="a" /><GlobalShot item={imageDetail} side="b" /></div><div className="row wrap"><Button onClick={() => startVideo(imageDetail.project_id, [imageDetail.group_id])}>生成视频</Button><Button variant="outline" onClick={() => goSource(imageDetail)}>回到来源图片组</Button></div></Modal>}
+    {batchAction && <Modal title={batchAction==='trash'?'移入回收站':batchAction==='restore'?'恢复图片组':'确认所选素材可用'} onClose={()=>!operating && setBatchAction(null)}>
+      <p>本次 {pickedGroups.length} 组，来自 {queueProjects.length} 个来源。</p>
+      <p className="muted">{batchAction==='trash'?'图片组移入回收站，可恢复。不会删除源文件、已生成视频或历史任务。':batchAction==='restore'?'恢复后可重新参与筛选与生成。':'请先检查图片与人物。确认可用不会替换人物侧，不会跳过水印检查或提交生成。'}</p>
+      <Button disabled={operating} onClick={async()=>{setOperating(true);try{const result=await api('workbench_group_batch',pickedGroups,batchAction);const failed=result.filter((r:any)=>!r.ok);setBatchResult(`成功 ${result.length-failed.length} 组，失败 ${failed.length} 组${failed.length?'：'+failed.map((r:any)=>`${r.project_id}/${r.group_id}：${r.message}`).join('；'):''}`);change({picked:failed.map((r:any)=>`${r.project_id}:${r.group_id}`)});setBatchAction(null);await refresh(true);}catch(e){setBatchResult(String(e));}finally{setOperating(false);}}}>{operating?'正在处理…':'确认操作'}</Button>
+    </Modal>}
+    {imageDetail && <Modal title={`${imageDetail.project_name} · 第${imageDetail.group_number}组`} onClose={() => setImageDetail(null)} wide><div className="overview-pair"><GlobalShot item={imageDetail} side="a" /><GlobalShot item={imageDetail} side="b" /></div><div className="row wrap"><Button disabled={imageDetail.trashed} onClick={() => startVideo(imageDetail.project_id, [imageDetail.group_id])}>仅生成本组</Button><Button variant="outline" onClick={() => goSource(imageDetail)}>回到来源图片组</Button></div></Modal>}
     {detail && <Modal title={`${detail.project_name} · ${detail.label || `第${detail.group_number}组`}`} description="查看该版本实际提交的记录；历史素材缺失时会明确提示。" onClose={() => setDetail(null)} wide>
       <p>{detail.model} · {detail.duration} 秒 · {detail.resolution} · Context-IR {detail.context_ir === true ? "开启" : detail.context_ir === false ? "关闭" : "未记录"}</p>
       {(detail.parts || [detail]).map((part: any, i: number) => <div key={i} className="submission-inputs">
@@ -1833,7 +1855,7 @@ function MediaGrid({ items, picked = [], setPicked, final = false, onDetails, so
 
 function Post() {
   const { lib, p, postIds, setPostIds, act, working } = useApp();
-  const [scope, setScope] = useState(postIds.length ? "all" : "project"),
+  const [scope, setScope] = useState("all"),
     [showParts, setShowParts] = useState(false),
     [edit, setEdit] = useState<any>(null),
     [settings, setSettings] = useState<any>(null),
@@ -1847,7 +1869,7 @@ function Post() {
   useEffect(loadSettings, []);
   const items = lib.items.filter(
     (v: any) =>
-      (v.kind === "post" ? v.source_path : v.kind === "assembly" ? v.available : v.archive_path) &&
+      !v.trashed && (v.kind === "post" ? v.source_path : v.kind === "assembly" ? v.available : v.archive_path) &&
       (showParts || !v.assembly_id || postIds.includes(v.id)) &&
       (scope === "all" || v.project_id === p?.id),
   );
@@ -1903,6 +1925,7 @@ function Post() {
         缺少字幕时，会将所选原片音轨交给阿里云识别，再由 FFmpeg 合成字幕。
         完成记录自动复用；只处理本次明确勾选的视频。
       </div>
+      <div className="batch-toolbar"><Button variant="outline" onClick={()=>setPostIds([...new Set([...postIds,...items.map((v:any)=>v.id)])])}>选择全部可后期视频</Button><span>已选 {postIds.length} 条</span></div>
       <div className="post-table">
         <div className="table-head">
           <span>选择 / 视频</span>
@@ -2039,15 +2062,32 @@ function Post() {
   );
 }
 
+function BatchMediaActions({ids,clear,trash=false,final=false}:any) {
+  const {act,refresh} = useApp();
+  const [action,setAction]=useState(''),[working,setWorking]=useState(false),[result,setResult]=useState('');
+  return <><div className="batch-toolbar">
+    {!trash && <Button variant="outline" disabled={!ids.length || working} onClick={async()=>{setWorking(true);try{await act(async()=>{const rows=await api('workbench_export_selected',ids);if(rows.length)setResult(`已导出 ${rows.filter((r:any)=>r.ok).length} 条${rows.some((r:any)=>!r.ok)?'；失败：'+rows.filter((r:any)=>!r.ok).map((r:any)=>r.message).join('；'):''}`);});}finally{setWorking(false);}}}>导出所选视频</Button>}
+    {trash ? <Button disabled={!ids.length || working} onClick={()=>setAction('restore')}>恢复所选视频</Button> : <>
+      <Button variant="outline" disabled={!ids.length || working} onClick={()=>setAction('trash')}>移入回收站</Button>
+      {final && <Button disabled={!ids.length || working} onClick={()=>setAction('accept')}>批量标记已验收</Button>}
+    </>}
+  </div>{result && <p className="notice" role="status">{result}</p>}
+  {action && <Modal title={action==='trash'?'移入回收站':action==='restore'?'恢复视频':'确认成片验收'} onClose={()=>!working && setAction('')}>
+    <p>本次操作 {ids.length} 条视频。</p><p className="muted">{action==='trash'?'只从素材列表移入回收站，文件和任务历史保留，可随时恢复。':action==='accept'?'请确认已经检查所选成片的对白、字幕与画面；处理完成不代表自动验收。':'恢复后重新显示在素材列表。'}</p>
+    <Button disabled={working} onClick={async()=>{setWorking(true);try{await act(async()=>{const rows=await api('workbench_media_batch',ids,action);const failed=rows.filter((r:any)=>!r.ok);setResult(`成功 ${rows.length-failed.length} 条，失败 ${failed.length} 条${failed.length?'：'+failed.map((r:any)=>r.message).join('；'):''}`);clear();setAction('');await refresh(true);});}finally{setWorking(false);}}}>确认操作</Button>
+  </Modal>}</>;
+}
+
 function LibraryPage() {
   const { lib, p } = useApp();
+  const [picked,setPicked] = useState<string[]>([]);
   const [filter, setFilter] = useState("all"),
     [search, setSearch] = useState("");
   const items = lib.items.filter(
     (v: any) =>
       v.kind === "post" &&
-      v.available &&
-      (filter === "all" ||
+      v.available && (filter==="trash"?v.trashed:!v.trashed) &&
+      (filter === "all" || filter === "trash" ||
         (filter === "review" && !v.accepted) ||
         (filter === "accepted" && v.accepted) ||
         (filter === "project" && v.project_id === p?.id)) &&
@@ -2064,8 +2104,8 @@ function LibraryPage() {
             placeholder="搜索项目或组号"
           />
         </div>
-        <Select value={filter} onChange={(e: any) => setFilter(e.target.value)}>
-          <option value="all">全部成片</option>
+        <Select value={filter} onChange={(e: any) => {setFilter(e.target.value);setPicked([]);}}>
+          <option value="all">全部成片</option><option value="trash">回收站</option>
           <option value="project">当前项目</option>
           <option value="review">待验收</option>
           <option value="accepted">已验收</option>
@@ -2075,7 +2115,9 @@ function LibraryPage() {
       <p className="muted">
         已导出表示技术处理完成；检查对白、字幕和画面后，再标记验收。
       </p>
-      <MediaGrid items={items} final />
+      <div className="batch-toolbar"><Button variant="outline" onClick={()=>setPicked(items.map((v:any)=>v.id))}>选择筛选结果</Button><Button variant="ghost" onClick={()=>setPicked([])}>清空选择</Button><span>已选 {picked.length} 条</span></div>
+      <BatchMediaActions ids={picked} clear={()=>setPicked([])} final trash={filter==='trash'}/>
+      <MediaGrid items={items} picked={picked} setPicked={setPicked} final />
     </>
   );
 }
@@ -2238,7 +2280,10 @@ function SettingsPage() {
 }
 
 function AgentPanel({ hidden }: any) {
-  const { p, agent, selected, act, busy, setPanel, setPage } = useApp();
+  const { p, agent, selected, act, busy, setPanel, setPage, page, overview, lib } = useApp();
+  const globalScope = ["overview","raw"].includes(page);
+  const globalVideos = globalScope && overview.tab==='videos';
+  const selectedGlobal = globalVideos ? (lib.items || []).filter((v:any)=>overview.videos.includes(v.id) && !v.trashed).flatMap((v:any)=>(v.group_ids || [v.group_id]).filter(Boolean).map((group_id:string)=>({project_id:v.project_id,group_id}))) : (lib.groups || []).filter((g:any)=>overview.picked.includes(g.id) && !g.trashed);
   const [text, setText] = useState(""),
     [models, setModels] = useState<any[]>([]),
     [model, setModel] = useState(""),
@@ -2293,11 +2338,11 @@ function AgentPanel({ hidden }: any) {
         <span className="dot" />
         {agent.busy
           ? `正在处理：${agent.active_project_name || p?.name || "原项目"}`
-          : p
+          : globalScope ? `下条消息作用于：总览已选 ${globalVideos?overview.videos.length:selectedGlobal.length} ${globalVideos?"条视频":"组图片"} · 跨 ${new Set(selectedGlobal.map((g:any)=>g.project_id)).size} 个来源` : p
             ? `下条消息作用于：${p.name} · 已选 ${selected.length} 组`
             : "尚未选择项目"}
       </div>
-      {agent.busy && agent.active_project_id !== p?.id && (
+      {agent.busy && !globalScope && agent.active_project_id !== p?.id && (
         <p className="agent-project-hint">
           当前浏览：{p?.name}
           。本轮继续处理原项目，完成后下一条消息使用当前项目。
@@ -2448,7 +2493,8 @@ function AgentPanel({ hidden }: any) {
           </Badge>
         ))}
         <Textarea
-          placeholder="描述你想完成的工作…"
+          aria-label="助手任务"
+          placeholder={globalScope?`针对总览勾选的 ${selectedGlobal.length} 组描述任务…`:"描述你想完成的工作…"}
           rows={4}
           value={text}
           onChange={(e) => setText(e.target.value)}
@@ -2457,7 +2503,7 @@ function AgentPanel({ hidden }: any) {
           <Button
             variant="ghost"
             size="sm"
-            disabled={!p || busy}
+            disabled={globalScope || !p || busy}
             onClick={() =>
               act(async () =>
                 setAttachments([
@@ -2482,7 +2528,7 @@ function AgentPanel({ hidden }: any) {
             <Button
               size="sm"
               disabled={
-                !p ||
+                (globalScope ? !selectedGlobal.length : !p) ||
                 busy ||
                 !agent.connected ||
                 !model ||
@@ -2490,7 +2536,8 @@ function AgentPanel({ hidden }: any) {
               }
               onClick={() =>
                 act(async () => {
-                  await api(
+                  if(globalScope) await api("agent_send_global",text,model,effort,selectedGlobal,globalVideos?overview.videos:null);
+                  else await api(
                     "agent_send",
                     text,
                     model,
