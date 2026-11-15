@@ -340,7 +340,8 @@ class VideoQueue:
             cfg = p['generation']
             task = next(iter(cfg.get('tasks', {}).values()), {})
             params = task.get('request_snapshot', {}).get('parameters', cfg)
-            state = {'phase': 'attention', 'error': self.runtime_errors[p['id']]} if p['id'] in self.runtime_errors else p['queue_state']
+            runtime_error = self.runtime_errors.get(p['id'])
+            state = {'phase': 'attention', 'error': runtime_error} if runtime_error else p['queue_state']
             rows.append({'id': p['id'], **p['video_job'], **state, 'created_at': cfg.get('submitted_at') or p['created_at'],
                 'model': params['model'], 'duration': params['duration'], 'resolution': params['resolution'], 'ratio': params['ratio'],
                 'prompt': task.get('request_snapshot', {}).get('bound_prompt') or cfg['global_prompt'],
