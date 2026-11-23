@@ -96,6 +96,17 @@ const assert = require("node:assert/strict");
             (_, name) =>
             async (...args) => {
               window.__calls.push([name, ...args]);
+              if(name === "scene_state") return {sheets:window.__sceneSheets || [], assets:[]};
+              if(name === "scene_save") {
+                const saved={...args[0], id:"test-scene", revision:args[0].revision+1};
+                window.__sceneSheets=[saved];
+                return saved;
+              }
+              if(name === "scene_plan") {
+                const shots=args[0].shots;
+                if(!shots.length || shots.some(s=>!s.text.trim()))throw Error("请填写镜头台词");
+                return [{seconds:3,shots:shots.map((s,i)=>({...s,number:i+1}))}];
+              }
               if (window.__failApi?.[name]) throw new Error(window.__failApi[name]);
               if(name==='workbench_tasks' && window.__tasksOverride)return {items:window.__tasksOverride};
               if (name === "workbench_tasks") return {items:[
@@ -1016,6 +1027,21 @@ const assert = require("node:assert/strict");
   assert.deepEqual(errors,[]);
   assert.deepEqual(await page.evaluate(()=>window.__unexpectedCalls || []),[]);
   console.log('PASS: cross-project batch handoff, repeated group IDs, saved scope, partial failure retry, exact payment preview, reversible deletion and compact UI');
+  await page.getByRole('button',{name:'双人场景制作',exact:true}).click();
+  await page.getByLabel('制作单名称').fill('场景回归');
+  await page.getByLabel('台词',{exact:true}).fill('我来说，你听。');
+  await page.getByLabel('画面拍谁').selectOption('B');
+  await page.getByText('第 1 段 · 镜头 1 · 预计 3 秒').waitFor();
+  assert.ok(await page.getByRole('button',{name:'导出制作包'}).isDisabled());
+  await page.getByRole('button',{name:'保存制作单'}).click();
+  await page.getByText('制作单已保存',{exact:true}).waitFor();
+  await page.getByRole('button',{name:'图片组总览',exact:true}).click();
+  await page.getByRole('button',{name:'双人场景制作',exact:true}).click();
+  assert.equal(await page.getByLabel('画面拍谁').inputValue(),'B');
+  assert.equal(await page.getByLabel('说话人').inputValue(),'A');
+  await page.screenshot({path:path.join(validation,'scene-production.png')});
+  assert.deepEqual(errors,[]);
+  console.log('PASS: scene draft keeps speaker and visible character independent after reopening');
   await browser.close();
 })().catch(async (e) => {
   console.error(e);

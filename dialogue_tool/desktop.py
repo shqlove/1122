@@ -25,6 +25,7 @@ from .settings import ROOT, settings
 from .project_run import analysis_running, workflow_lock
 from .assets import catalog, import_asset
 from .workbench import WorkbenchMixin
+from .scene_sheet import SLOTS, SceneSheets, plan_segments
 
 
 def project_write(method):
@@ -79,6 +80,58 @@ class DesktopAPI(WorkbenchMixin):
     def _phone_distribution(self):
         from .phone_distribution import PhoneDistribution
         return PhoneDistribution(self._service.projects.root, postprocess_root=self._post_root())
+
+    def _scene_store(self):
+        return SceneSheets(self._service.projects.root)
+
+    def scene_state(self):
+        store = self._scene_store()
+        assets = [{k: a[k] for k in ('asset_id', 'kind', 'name', 'duration')} for a in catalog(store.assets)]
+        return {'sheets': store.sheets(), 'assets': assets}
+
+    def scene_save(self, sheet):
+        return self._scene_store().save(sheet)
+
+    def scene_plan(self, sheet):
+        return plan_segments(sheet)
+
+    def scene_choose_asset(self, slot):
+        import webview
+        from .assets import IMAGES
+        kind = SLOTS[slot][1]
+        filters = ('图片 (*.jpg;*.jpeg;*.png;*.webp;*.bmp)',) if kind == 'image' else ('音频 (*.mp3;*.wav;*.m4a;*.aac;*.flac;*.ogg)',)
+        picked = self._window.create_file_dialog(webview.FileDialog.OPEN, allow_multiple=False, file_types=filters)
+        if not picked:
+            return None
+        if kind == 'image' and Path(picked[0]).suffix.lower() not in IMAGES:
+            raise ValueError('请选择人物或场景图片')
+        store = self._scene_store()
+        with workflow_lock(store.folder):
+            a = import_asset(picked[0], store.assets, self._service.config, voice=(kind == 'audio'))
+        return {k: a[k] for k in ('asset_id', 'kind', 'name', 'duration')}
+
+    def scene_preview(self, asset_id):
+        from .media_server import MediaServer
+        with self.lock:
+            store = self._scene_store()
+            asset = next((a for a in catalog(store.assets) if a['asset_id'] == asset_id), None)
+            if not asset:
+                raise ValueError('找不到已导入的场景素材')
+            if not hasattr(self, '_media_server'):
+                self._media_server = MediaServer()
+            return self._media_server.register(asset['path'])
+
+    def scene_export(self, sheet):
+        import webview
+        chosen = self._window.create_file_dialog(webview.FileDialog.SAVE, save_filename='双人场景制作包.zip',
+                                                  file_types=('制作包 (*.zip)',))
+        if not chosen:
+            return None
+        target = Path(chosen if isinstance(chosen, str) else chosen[0])
+        if target.suffix.lower() != '.zip':
+            raise ValueError('请使用 .zip 文件名保存制作包')
+        self._scene_store().export(sheet, target)
+        return str(target)
 
     def phone_distribution_state(self):
         return self._phone_distribution().state()

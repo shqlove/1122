@@ -50,6 +50,7 @@ import { PublicationDestination } from "./Publication";
 import { DouyinPublish } from "./DouyinPublish";
 import { PublishedCleanup } from "./PublishedCleanup";
 import { VideoProgress } from "./VideoProgress";
+import { SceneStudio } from "./SceneStudio";
 
 const Context = createContext<any>(null);
 const useApp = () => useContext(Context);
@@ -86,6 +87,7 @@ function Poster({ item }: any) {
 }
 const pages = [
   ["overview", "图片组总览", Images],
+  ["scenes", "双人场景制作", Clapperboard],
   ["generate", "视频生成", Clapperboard],
   ["tasks", "我的任务", Clock],
   ["raw", "原片库", Film],
@@ -382,6 +384,7 @@ export default function App() {
             {pages.map(([id, label, Icon], i) => (
               <button
                 key={id}
+                data-page={id}
                 className={page === id ? "nav-item active" : "nav-item"}
                 onClick={() => {if(id==="overview" || id==="raw")setOverview((v:any)=>({...v,tab:id==="raw"?"videos":"groups",filter:"all"}));setPage(id);}}
               >
@@ -413,7 +416,7 @@ export default function App() {
               <strong>{name}</strong>
             </div>
             <div className="top-actions">
-              {page === "skills" ? null : ["overview", "raw", "generate", "tasks", "post", "library"].includes(page) ? <Badge variant="secondary">{page === "generate" ? "独立视频任务" : page === "tasks" ? "全部项目 · 提交记录" : "全部项目 · 素材总览"}</Badge> : <Select
+              {["skills","scenes"].includes(page) ? null : ["overview", "raw", "generate", "tasks", "post", "library"].includes(page) ? <Badge variant="secondary">{page === "generate" ? "独立视频任务" : page === "tasks" ? "全部项目 · 提交记录" : "全部项目 · 素材总览"}</Badge> : <Select
                 aria-label="当前项目"
                 value={p?.id || ""}
                 disabled={working || state.navigation_busy}
@@ -442,7 +445,7 @@ export default function App() {
           <div className="body-row">
             <main className={["overview","raw"].includes(page)?"main-content overview-main":"main-content"} ref={mainRef}>
               <div className="page-heading" hidden={page === "generate"}>
-                {page !== "skills" && <div className="eyebrow">
+                {!["skills","scenes"].includes(page) && <div className="eyebrow">
                   {page === "settings"
                     ? "WORKSPACE SETTINGS"
                     : page === "overview" ? "ALL PROJECTS / 素材总览"
@@ -455,6 +458,7 @@ export default function App() {
                   {
                     {
                       overview: "跨来源筛选图片组，确认素材并批量生成。",
+                      scenes: "编排双人对话，核对人物、场景和音色后导出制作包。",
                       raw: "检查完整原片，批量选择后开始后期。",
                       projects:
                         "从一段素材开始，让每一组对话都有完整的制作记录。",
@@ -492,6 +496,8 @@ export default function App() {
               )}
               {["overview", "raw"].includes(page) ? (
                 <Overview />
+              ) : page === "scenes" ? (
+                <SceneStudio ready={ready}/>
               ) : page === "projects" ? (
                 <Projects />
               ) : page === "groups" ? (
