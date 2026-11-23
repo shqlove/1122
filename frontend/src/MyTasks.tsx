@@ -1,13 +1,14 @@
 import { useEffect, useRef, useState } from 'react';
 import { Film, Search, RefreshCw } from 'lucide-react';
 import { api } from './lib/api';
+import { VideoProgress } from './VideoProgress';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from '@/components/ui/dialog';
 
 const tabs = [['all','全部'],['running','生成中'],['completed','已完成'],['attention','待处理'],['failed','失败 / 取消'],['draft','待提交']];
-let savedFilters = {search:'',project:'all',provider:'all',status:'all'};
+let savedFilters = {search:'',project:'all',provider:'all',status:'all',batch:'all'};
 const date = (value:any) => value ? new Date(typeof value==='number'?value*1000:value).toLocaleString('zh-CN',{hour12:false}) : '时间未记录';
 const errorText = (value:any) => typeof value==='string'?value:value?.message || (value?JSON.stringify(value):'');
 
@@ -49,12 +50,14 @@ function TaskDetail({item,onClose}:any) {
     if(item.available)api('workbench_media',item.id).then(v=>{if(live)setUrl(v.url);}).catch(e=>{if(live)setError(String(e));});
     return()=>{live=false;};
   },[item.id,item.available]);
-  return <Dialog open onOpenChange={v=>{if(!v)onClose();}}><DialogContent className="task-detail">
+  return <Dialog open onOpenChange={v=>{if(!v)onClose();}}><DialogContent className="task-detail bounded-dialog">
     <DialogHeader><DialogTitle>任务详情 · 第 {item.group_number || '—'} 组{item.segment?.count>1 && ` · 第 ${item.segment.index}/${item.segment.count} 段`}</DialogTitle>
       <DialogDescription>{item.project_name} · {item.status_label}</DialogDescription></DialogHeader>
+    <div className="dialog-scroll">
     {url && <video key={item.id} controls preload="metadata" src={url} className="task-video"/>}
     {!item.available && <p className="notice">{item.status==='completed'?'平台已生成，视频尚未下载到工作台。':'视频下载完成后，可在这里播放。'}</p>}
     {(error || item.error) && <p className="notice error">{error || errorText(item.error)}</p>}
+    <VideoProgress row={item}/>
     <div className="task-facts">
       <span>渠道：{item.provider_label}</span><span>模型：{item.model || '—'}</span>
       <span>参数：{item.duration || '—'} 秒 · {item.ratio || '—'} · {item.resolution || '—'}</span>
@@ -69,12 +72,13 @@ function TaskDetail({item,onClose}:any) {
     <h3>当次参考素材</h3>
     <div className="task-reference-grid">{(item.references || []).filter((r:any)=>r.sha256).map((r:any,i:number)=><Reference key={`${r.sha256}:${i}`} itemId={item.id} reference={r}/>)}</div>
     {!item.references?.length && <p className="muted">这条记录暂未保存参考素材快照。</p>}
+    </div><div className="dialog-footer"><Button variant="outline" onClick={onClose}>关闭详情</Button></div>
   </DialogContent></Dialog>;
 }
 
-export function MyTasks({onGenerate}:any) {
+export function MyTasks({onGenerate,onResume,onEdit}:any) {
   const [items,setItems]=useState<any[]>([]),[filters,setFilters]=useState(savedFilters),[limit,setLimit]=useState(20);
-  const [selected,setSelected]=useState<any>(null),[error,setError]=useState(''),[loading,setLoading]=useState(false);
+  const [selected,setSelected]=useState<any>(null),[error,setError]=useState(''),[loading,setLoading]=useState(false),[acting,setActing]=useState(false),[message,setMessage]=useState(''),[actionError,setActionError]=useState('');
   const inFlight=useRef(false),mounted=useRef(true);
   const refresh=async()=>{
     if(inFlight.current)return;inFlight.current=true;setLoading(true);
@@ -86,28 +90,39 @@ export function MyTasks({onGenerate}:any) {
   useEffect(()=>{savedFilters=filters;},[filters]);
   const change=(v:any)=>{setFilters(f=>({...f,...v}));setLimit(20);};
   const projects=[...new Map(items.map(i=>[i.project_id,i.project_name])).entries()];
-  const matching=items.filter(i=>(filters.project==='all'||i.project_id===filters.project) && (filters.provider==='all'||i.provider===filters.provider) &&
+  const batches=[...new Set(items.map(i=>i.creation_id || i.batch_id).filter(Boolean))];
+  const draftAction=async(item:any,action:string)=>{setActing(true);try{const draft=await api('workbench_video_draft',item.batch_id,action);if(action==='edit')onEdit(draft);else await refresh();}catch(e){setError(String(e));}finally{setActing(false);}};
+  const resumeLegacy=async(item:any)=>{setActing(true);setActionError('');setMessage('正在查询此旧轮次并下载可用视频…');try{const result=await api('workbench_legacy_resume',item.id);await refresh();setMessage(result.message);}catch(e){setMessage('');setActionError(String(e));await refresh();}finally{setActing(false);}};
+  const canEdit=(item:any)=>!!item.batch_id && items.filter(i=>i.batch_id===item.batch_id).every(i=>!i.submitted && !i.busy && ['preparing','needs_review','attention','awaiting_approval'].includes(i.queue_phase));
+  const matching=items.filter(i=>(filters.batch==='all'||(i.creation_id || i.batch_id)===filters.batch) && (filters.project==='all'||i.project_id===filters.project) && (filters.provider==='all'||i.provider===filters.provider) &&
     `${i.submit_id || ''} ${i.task_id || ''} ${i.project_name} ${i.group_number} ${i.prompt || ''}`.toLowerCase().includes(filters.search.trim().toLowerCase()));
   const filtered=matching.filter(i=>filters.status==='all'||i.category===filters.status);
   return <div className="my-tasks">
     <div className="task-toolbar"><div className="task-search"><Search size={16}/><Input aria-label="搜索任务" placeholder="搜索提示词、项目或任务 ID" value={filters.search} onChange={e=>change({search:e.target.value})}/></div>
       <select aria-label="任务渠道" value={filters.provider} onChange={e=>change({provider:e.target.value})}><option value="all">全部渠道</option><option value="compshare">优云智算 H3</option><option value="dreamina">即梦</option></select>
       <select aria-label="任务来源项目" value={filters.project} onChange={e=>change({project:e.target.value})}><option value="all">全部项目</option>{projects.map(([id,name])=><option key={id} value={id}>{name} · {id.slice(0,6)}</option>)}</select>
+      <select aria-label="任务批次" value={filters.batch} onChange={e=>change({batch:e.target.value})}><option value="all">全部批次</option>{batches.map(id=><option key={id} value={id}>批次 {id.slice(0,8)}</option>)}</select>
       <Button variant="outline" disabled={loading} onClick={refresh}><RefreshCw size={15}/>刷新列表</Button><Button onClick={onGenerate}>新建视频</Button>
     </div>
     <div className="task-tabs" role="tablist" aria-label="任务状态">{tabs.map(([key,label])=><button key={key} role="tab" aria-selected={filters.status===key} onClick={()=>change({status:key})}>{label}<span>{matching.filter(i=>key==='all'||i.category===key).length}</span></button>)}</div>
-    <p className="muted">工作台保存的全部提交与历史轮次，每条独立展示。已生成但下载失败的任务保留在“待处理”；分段原片也可分别查看。</p>
-    {error && <p className="notice error" role="alert">{error}</p>}
+    <p className="muted">工作台保存的全部提交与历史轮次，每条独立展示。后台自动同步、下载与合并；网络短暂中断会自动重试。需要你处理的任务才放入“待处理”。</p>
+    {(error || actionError) && <p className="notice error" role="alert">{error || actionError}</p>}
+    {message && <p className="notice" role="status">{message}</p>}
     {!filtered.length && !loading && <div className="empty"><Film size={32}/><p>{items.length?'没有符合筛选条件的任务':'还没有任务记录，提交后会在这里自动显示。'}</p></div>}
     <div className="task-list">{filtered.slice(0,limit).map(item=><article className="task-row" key={item.id}>
       <TaskThumb item={item} onClick={()=>setSelected(item)}/>
       <div className="task-row-main"><div className="task-row-title"><strong>{item.project_name} · 第 {item.group_number || '—'} 组{item.segment?.count>1 && ` · 第 ${item.segment.index}/${item.segment.count} 段`}</strong><Badge className={`task-state ${item.category}`}>{item.status_label}</Badge></div>
         <p className="task-prompt-excerpt">{item.prompt || '未保存提示词'}</p>
         <p className="task-row-meta">{item.provider_label} · {item.duration || '—'} 秒 · {item.resolution || '—'} · {item.ratio || '—'} <span>{date(item.created_at)}</span></p>
-        <p className="task-row-id">{item.submit_id || item.task_id || '尚未提交'}{item.round!=null && item.round>=0 && ' · 历史轮次'}</p>
+        <p className="task-row-id">{item.submit_id || item.task_id || '尚未提交'}{item.round!=null && item.round>=0 && ' · 历史轮次'}{item.batch_id && ` · 批次 ${(item.creation_id || item.batch_id).slice(0,8)}`}</p>
+        <VideoProgress row={item}/>
         {item.error && <p className="task-row-error">{errorText(item.error)}</p>}
       </div>
-      <Button className="task-view-button" variant="outline" onClick={()=>setSelected(item)}>{item.available?'播放 / 详情':'查看详情'}</Button>
+      <div className="task-actions"><Button className="task-view-button" variant="outline" onClick={()=>setSelected(item)}>{item.available?'播放 / 详情':'查看详情'}</Button>
+        {item.batch_id && item.queue_phase!=='canceled' && <Button variant="outline" onClick={()=>onResume(item.creation_id || item.batch_id)}>继续本批</Button>}
+        {!item.job_id && !item.batch_id && item.submitted && ['running','attention'].includes(item.category) && <Button variant="outline" disabled={acting} title="查询并下载此旧轮次的已提交视频，不重新生成" onClick={()=>resumeLegacy(item)}>继续旧轮次（查询 / 下载）</Button>}
+        {canEdit(item) && <><Button variant="ghost" disabled={acting} onClick={()=>draftAction(item,'edit')}>修改草稿（重新报价）</Button><Button variant="ghost" disabled={acting} onClick={()=>draftAction(item,'remove')}>移除本组草稿</Button></>}
+      </div>
     </article>)}</div>
     {filtered.length>limit && <Button variant="outline" onClick={()=>setLimit(n=>n+20)}>显示更多（还有 {filtered.length-limit} 条）</Button>}
     {selected && <TaskDetail key={selected.id} item={items.find(i=>i.id===selected.id) || selected} onClose={()=>setSelected(null)}/>}

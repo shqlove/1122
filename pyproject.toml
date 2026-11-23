@@ -12,7 +12,7 @@ dependencies = ["Pillow>=10,<13", "jsonschema>=4.22,<5", "scenedetect>=0.7.2,<0.
 [project.optional-dependencies]
 repair = ["torch>=2.2,<3", "numpy>=1.26,<3"]
 test = ["pytest>=8,<10"]
-desktop = ["pywebview>=5,<7"]
+desktop = ["pywebview>=5,<7", "websocket-client>=1.8,<2; sys_platform == 'win32'", "tidevice>=0.12.11,<0.13; sys_platform == 'win32'"]
 
 [project.scripts]
 dialogue-tool = "dialogue_tool.cli:main"
@@ -21,7 +21,7 @@ dialogue-tool = "dialogue_tool.cli:main"
 include = ["dialogue_tool*"]
 
 [tool.setuptools.package-data]
-dialogue_tool = ["ui/*.html", "ui/*.css", "ui/*.js", "ui/app/*.html", "ui/app/*.css", "ui/app/*.js", "ui/brand/logo.png", "ui/brand/workbench.ico", "resources/h3-first-v1/*.json", "resources/h3-first-v1/*.mp3"]
+dialogue_tool = ["ui/*.html", "ui/*.css", "ui/*.js", "ui/app/*.html", "ui/app/*.css", "ui/app/*.js", "ui/brand/logo.png", "ui/brand/workbench.ico", "resources/h3-first-v1/*.json", "resources/h3-first-v1/*.mp3", "skills/*/SKILL.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -17,7 +17,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlparse
 
 from PIL import Image
-from .generation import CanvasWorkflow, CanvasError, bind_prompt, _sha
+from .generation import CanvasWorkflow, CanvasError, bind_prompt, _sha, download_folder
 from .media import probe
 from .projects import character_filter
 from .h3_errors import H3Error, failure, network_reason, provider_reason, redact
@@ -700,7 +700,7 @@ class CompShareWorkflow(CanvasWorkflow):
         url = content.get('url', '') if isinstance(content, dict) else ''
         if urlparse(url).scheme != 'https':
             raise self.client.response_error(path, '视频已生成，但平台尚未提供可下载的文件地址，请稍后重试下载')
-        folder = Path(p['directory']) / 'generated-videos' / t['group_id'] / t['submit_id']
+        folder = download_folder(p, t)
         file = folder / 'video.mp4'; partial = folder / 'video.partial'
         try:
             folder.mkdir(parents=True, exist_ok=True)
@@ -725,7 +725,11 @@ class CompShareWorkflow(CanvasWorkflow):
             raise failure(self.service.config, code, '下载视频时未能完成文件传输。' + message,
                           retryable=retryable, path='download/video', cause=exc) from None
         finally:
-            partial.unlink(missing_ok=True)
+            try:
+                partial.unlink(missing_ok=True)
+            except OSError:
+                # A bad local path must not mask the original diagnostic.
+                pass
         t.update(status='downloaded', output=str(file), sha256=_sha(file), media_info={'duration': duration}, actual_resolution=task.get('resolution'))
 
 

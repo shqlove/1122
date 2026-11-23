@@ -3,6 +3,7 @@ import copy
 import logging
 import queue
 import shutil
+import subprocess
 import threading
 import time
 import uuid
@@ -13,9 +14,13 @@ from .workflow_api import WorkflowAPI
 from .compshare import channel_for
 from .generation import _sha
 from .projects import original_frame, project_asset
-from .project_run import workflow_lock
+from .project_run import workflow_lock, AnalysisBusy
 from .h3_baseline import apply_baseline, review_valid
 from .dialogue_segments import enabled, split_prompts
+
+POLL_SECONDS = 10
+RETRY_DELAYS = (5, 15, 30, 60, 120, 300)
+MAX_RETRIES = 12
 
 _queues = {}
 _queues_lock = threading.RLock()
@@ -43,6 +48,7 @@ class VideoQueue:
         self.lanes = {}
         self.stop = threading.Event()
         self.assembly_lock = threading.Lock()
+        self.scheduler = None
 
     def _save_state(self, jid, phase, error=None):
         p = self.service.projects.get(jid)
@@ -267,31 +273,114 @@ class VideoQueue:
         p = self.service.projects.get(jid)
         tasks = p.get('generation', {}).get('tasks', {})
         if any(t.get('submit_id') for t in tasks.values()):
-            return self._start(jid, lambda: self._watch(jid))
+            def follow():
+                with workflow_lock(Path(p['directory'])):
+                    self._progress(jid, 'tracking', retry_counts={}, retry_exhausted=False, next_attempt_at=None)
+                self._watch(jid)
+            return self._start(jid, follow)
         if jid in self.runtime_errors or p['queue_state']['phase'] in ('attention', 'awaiting_approval'):
             return self._start(jid, lambda: self._prepare(jid))
         return False
 
-    def _watch(self, jid):
-        self._save_state(jid, 'tracking')
-        for _ in range(180):
-            if self.stop.is_set():
+    def _progress(self, jid, phase, error=None, **tracking):
+        p = self.service.projects.get(jid)
+        p.setdefault('tracking', {}).update(tracking)
+        p['queue_state'] = {'phase': phase, 'error': error, 'updated_at': time.time()}
+        self.service.projects.save(p)
+        self.runtime_errors.pop(jid, None)
+
+    def _ensure_scheduler(self):
+        with self.lock:
+            if self.scheduler and self.scheduler.is_alive():
                 return
+            def monitor():
+                while not self.stop.wait(1):
+                    try:
+                        self._run_due()
+                    except Exception:
+                        logging.getLogger(__name__).exception('Could not schedule saved video follow-up')
+            self.scheduler = threading.Thread(target=monitor, daemon=True)
+            self.scheduler.start()
+
+    def _run_due(self):
+        # Waiting never occupies a worker. Pages only read these saved records.
+        for p in self.service.projects.list():
+            track = p.get('tracking', {})
+            if (p.get('video_job') and track.get('auto_follow') and
+                    track.get('next_attempt_at') is not None and track['next_attempt_at'] <= time.time() and
+                    p.get('queue_state', {}).get('phase') in ('tracking', 'retry_wait')):
+                self._start(p['id'], lambda jid=p['id']: self._watch(jid))
+
+    def _schedule(self, jid, phase, delay, error=None, **tracking):
+        self._progress(jid, phase, error, next_attempt_at=time.time() + delay,
+                       auto_follow=True, **tracking)
+        self._ensure_scheduler()
+
+    def _follow_failure(self, jid, stage, exc):
+        track = self.service.projects.get(jid).get('tracking', {})
+        counts = dict(track.get('retry_counts', {}))
+        counts[stage] = counts.get(stage, 0) + 1
+        retryable = getattr(exc, 'retryable', isinstance(exc, (TimeoutError, ConnectionError, AnalysisBusy)) or isinstance(exc.__cause__, (TimeoutError, ConnectionError, subprocess.TimeoutExpired)))
+        if retryable and counts[stage] <= MAX_RETRIES:
+            delay = RETRY_DELAYS[min(counts[stage] - 1, len(RETRY_DELAYS) - 1)]
+            self._schedule(jid, 'retry_wait', delay, str(exc), stage=stage,
+                           retry_counts=counts, retry_exhausted=False,
+                           connection_error=stage == 'query')
+        else:
+            self._progress(jid, 'attention', str(exc), stage=stage, retry_counts=counts,
+                           retry_exhausted=bool(retryable), auto_follow=False, next_attempt_at=None,
+                           connection_error=stage == 'query')
+
+    def _watch(self, jid):
+        """One query/download/assembly attempt, always using the original submission."""
+        if self.stop.is_set():
+            return
+        stage = 'query'
+        try:
             with workflow_lock(Path(self.service.projects.get(jid)['directory'])):
-                self.api.execute(jid, 'refresh_results')
-                self.api.execute(jid, 'download_results')
+                p = self.service.projects.get(jid)
+                tasks = list(p.get('generation', {}).get('tasks', {}).values())
+                if not tasks or any(not t.get('submit_id') for t in tasks):
+                    raise ValueError('未记录原提交 ID，不能自动继续；请核对原任务')
+                states = [t.get('status') for t in tasks]
+                if any(s in ('failed', 'canceled', 'completed_no_resource', 'requires_manual_review') for s in states):
+                    self._progress(jid, 'attention', '平台任务未成功完成，请查看原任务',
+                                   auto_follow=False, next_attempt_at=None)
+                    return
+                # H3 refresh can advance old audio-first plans by submitting video. This
+                # follower is query-only; unknown/missing video IDs require explicit review.
+                if channel_for(p['generation']['model']) == 'compshare' and any(not t.get('task_id') for t in tasks):
+                    raise ValueError('尚未取得平台视频任务 ID，请核对原提交；不会重新提交生成')
+                counts = dict(p.get('tracking', {}).get('retry_counts', {}))
+                self._progress(jid, 'tracking', stage=stage, last_attempt_at=time.time(),
+                               next_attempt_at=None, auto_follow=True, retry_exhausted=False)
+                if any(s not in ('completed', 'downloaded') for s in states):
+                    self.api.execute(jid, 'refresh_results')
+                    counts['query'] = 0
+                    self._progress(jid, 'tracking', stage=stage, last_checked_at=time.time(),
+                                   connection_error=False, retry_counts=counts)
                 p = self.service.projects.get(jid)
                 states = [t.get('status') for t in p['generation']['tasks'].values()]
-            if states and all(s == 'downloaded' for s in states):
-                self._save_state(jid, 'downloaded')
-                self._assemble(p['video_job']['batch_id'])
-                return
-            if not states or any(s in ('failed', 'canceled', 'completed_no_resource', 'requires_manual_review') for s in states):
-                self._save_state(jid, 'attention', '平台任务未成功完成，请查看原任务；不会自动重新付费')
-                return
-            if self.stop.wait(10):
-                return
-        self._save_state(jid, 'attention', '自动等待已结束，可查询本条原任务继续')
+                if any(s in ('failed', 'canceled', 'completed_no_resource', 'requires_manual_review') for s in states):
+                    self._progress(jid, 'attention', '平台任务未成功完成，请查看原任务',
+                                   auto_follow=False, next_attempt_at=None)
+                    return
+                if not all(s in ('completed', 'downloaded') for s in states):
+                    self._schedule(jid, 'tracking', POLL_SECONDS, stage='query', connection_error=False)
+                    return
+                stage = 'download'
+                self._progress(jid, 'downloading', stage=stage, connection_error=False)
+                self.api.execute(jid, 'download_results')
+                counts['download'] = 0
+                self._progress(jid, 'assembling', stage='assembly', retry_counts=counts,
+                               downloaded_at=time.time())
+            stage = 'assembly'
+            self._assemble(p['video_job']['batch_id'])
+            counts['assembly'] = 0
+            self._progress(jid, 'downloaded', stage='done', auto_follow=False,
+                           next_attempt_at=None, retry_counts=counts, connection_error=False)
+        except Exception as exc:
+            self._follow_failure(jid, stage, exc)
 
     def _assemble(self, batch_id):
         from .segment_assembly import assemble_segments
@@ -322,13 +411,19 @@ class VideoQueue:
             assemble_segments(self.service, parent)
 
     def resume(self):
+        self._ensure_scheduler()
         for p in self.service.projects.list():
             if not p.get('video_job'):
                 continue
             phase = p.get('queue_state', {}).get('phase')
-            if phase in ('submitting', 'tracking'):
-                if not self.refresh(p['id']):
-                    self._save_state(p['id'], 'attention', '提交过程曾中断，未记录提交ID；请重新核对报价，不会自动付费')
+            if phase in ('submitting', 'tracking', 'downloading', 'assembling'):
+                if any(t.get('submit_id') for t in p.get('generation', {}).get('tasks', {}).values()):
+                    self._start(p['id'], lambda jid=p['id']: self._watch(jid))
+                else:
+                    self._save_state(p['id'], 'attention', '提交过程曾中断，未记录提交ID；请核对原任务，不会自动付费')
+            elif phase == 'retry_wait':
+                # Preserve the deadline and attempt budget across app restarts.
+                continue
             elif phase == 'preparing':
                 self._save_state(p['id'], 'attention', '准备过程曾中断，请检查本条后继续报价')
             elif phase == 'downloaded':
@@ -336,7 +431,9 @@ class VideoQueue:
 
     def rows(self):
         rows = []
-        for p in self.service.projects.list():
+        projects = self.service.projects.list()
+        assemblies = {p['video_assembly']: p for p in projects if p.get('video_assembly')}
+        for p in projects:
             if not p.get('video_job'):
                 continue
             cfg = p['generation']
@@ -344,12 +441,27 @@ class VideoQueue:
             params = task.get('request_snapshot', {}).get('parameters', cfg)
             runtime_error = self.runtime_errors.get(p['id'])
             state = {'phase': 'attention', 'error': runtime_error} if runtime_error else p['queue_state']
+            meta = p['video_job']
+            local = bool(task.get('output') and Path(task['output']).is_file())
+            parent = assemblies.get(meta['batch_id'], {})
+            assembly = parent.get('generation', {}).get('dialogue_plans', {}).get(meta['source_group_id'], {}).get('assembly', {})
+            complete_output = (task.get('output') if meta['part_count'] == 1 else assembly.get('output'))
+            complete_ready = bool(complete_output and Path(complete_output).is_file())
+            complete_id = ('video-job:' + p['id'] if meta['part_count'] == 1 else
+                           'video-assembly:assembly-' + meta['batch_id'] + ':' + meta['source_group_id'])
+            tracking = copy.deepcopy(p.get('tracking', {}))
+            tracking['stale'] = bool(task.get('submit_id') and task.get('status') not in ('completed', 'downloaded', 'failed', 'canceled') and
+                                     (tracking.get('connection_error') or not tracking.get('last_checked_at') or time.time() - tracking['last_checked_at'] > 90))
             rows.append({'id': p['id'], **p['video_job'], **state, 'created_at': cfg.get('submitted_at') or p['created_at'],
                 'model': params['model'], 'duration': params['duration'], 'resolution': params['resolution'], 'ratio': params['ratio'],
                 'prompt': task.get('request_snapshot', {}).get('bound_prompt') or cfg['global_prompt'],
                 'role_bindings': task.get('request_snapshot', {}).get('role_bindings', task.get('references', [])),
                 'queued': p['id'] in self.waiting, 'context_ir': params.get('use_context_ir'), 'card': cfg.get('pending_approval'), 'submit_id': task.get('submit_id'),
-                'task_id': task.get('task_id'), 'task_status': task.get('status'), 'output': task.get('output'),
+                'task_id': task.get('task_id'), 'task_status': task.get('status'),
+                'tracking': tracking, 'local_available': local,
+                'platform_complete': task.get('status') in ('completed', 'downloaded'),
+                'complete_ready': complete_ready, 'complete_output': complete_output if complete_ready else None,
+                'complete_id': complete_id if complete_ready else None, 'output': task.get('output'),
                 'archive_path': task.get('archive_output'),
                 'task_error': task.get('submit_error') or task.get('error') or task.get('download_error') or task.get('query_error'),
                 'busy': p['id'] in self.active,
@@ -382,11 +494,13 @@ class VideoQueue:
         for row in self.rows():
             items.append({'id':'video-job:'+row['id'], 'kind':'generation', 'project_id':row['source_project_id'],
                 'project_name':row['source_project_name'], 'group_id':row['source_group_id'], 'group_number':row['group_number'],
-                'status':row['task_status'] or row['phase'], 'path':row['output'], 'archive_path':row['archive_path'],
+                'status':'canceled' if row['phase']=='canceled' else row['task_status'] or row['phase'], 'path':row['output'], 'archive_path':row['archive_path'],
                 'available':bool(row['output'] and Path(row['output']).is_file()),
                 'duration':row['duration'], 'model':row['model'], 'resolution':row['resolution'], 'ratio':row['ratio'],
                 'created_at':row['created_at'], 'submit_id':row['submit_id'], 'task_id':row['task_id'],
                 'queue_phase':row['phase'], 'error':row.get('error') or row['task_error'], 'job_id':row['id'],
-                'assembly_id':links.get(row['id']),
+                'assembly_id':links.get(row['id']), 'batch_id':row['batch_id'],
+                'creation_id':row.get('creation_id'), 'busy':row['busy'],
+                **{key:row[key] for key in ('tracking','platform_complete','local_available','complete_ready','complete_id','complete_output')},
                 'context_ir':row['context_ir'], 'prompt':row['prompt'], 'references':row['role_bindings'], 'segment':{'index':row['part'],'count':row['part_count']}})
         return items

@@ -1,8 +1,10 @@
 import json
 import queue
 import time
+from pathlib import Path
 
 import pytest
+from PIL import Image
 
 from dialogue_tool.agent import AgentManager
 from dialogue_tool.service import Service
@@ -24,6 +26,39 @@ def test_tools_do_not_offer_payment_approval_or_shell():
     names = {t['name'] for t in dynamic_tools()}
     assert 'workbench_request_submission' in names
     assert not any('approve' in n or 'shell' in n or 'command' in n for n in names)
+
+
+def test_view_group_exposes_hashes_for_review_and_rejects_changed_image(project):
+    from dialogue_tool.generation import _sha
+
+    service, pid = project
+    p = service.projects.get(pid)
+    for side in ('a', 'b'):
+        path = Path(p['directory']) / f'{side}.png'
+        Image.new('RGB', (1200, 900), 'blue').save(path)
+        p['groups'][0]['repaired_' + side] = str(path)
+    service.projects.save(p)
+    agent = AgentManager(service)
+    result = agent._tool(pid, {'tool': 'workbench_view_group', 'callId': 'view',
+                              'arguments': {'group_id': 'first'}}, ['first'])
+    metadata = json.loads(result['contentItems'][0]['text'])
+    assert len([item for item in result['contentItems'] if item['type'] == 'inputImage']) == 2
+    for image in metadata['images']:
+        assert image['sha256'] == _sha(Path(image['path']))
+        assert (image['width'], image['height']) == (1200, 900)
+        assert 'image_url' not in image
+        agent._tool(pid, {'tool': 'workbench_record_reference_review', 'callId': 'review-' + image['side'],
+                         'arguments': {'group_id': 'first', 'side': image['side'],
+                                       'sha256': image['sha256'], 'clean': True}}, ['first'])
+    saved = service.projects.get(pid)['groups'][0]['reference_reviews']
+    assert all(saved[image['side']] == {'sha256': image['sha256'], 'clean': True}
+               for image in metadata['images'])
+    image = metadata['images'][0]
+    Image.new('RGB', (1200, 900), 'green').save(image['path'])
+    with pytest.raises(ValueError, match='图片已变化'):
+        agent._tool(pid, {'tool': 'workbench_record_reference_review', 'callId': 'stale',
+                         'arguments': {'group_id': 'first', 'side': image['side'],
+                                       'sha256': image['sha256'], 'clean': True}}, ['first'])
 
 
 def test_quote_scope_uses_original_group_for_dialogue_parts(project, monkeypatch):
@@ -95,8 +130,12 @@ class FakeClient:
     def request(self, method, args=None):
         self.calls.append((method, args))
         if method == 'model/list':
-            return {'data': [{'model': 'test-model', 'isDefault': True, 'defaultReasoningEffort': 'low',
-                'supportedReasoningEfforts': [{'reasoningEffort': 'low'}, {'reasoningEffort': 'high'}]}]}
+            return {'data': [
+                {'model': 'gpt-6.2-astra', 'isDefault': True, 'defaultReasoningEffort': 'high',
+                 'supportedReasoningEfforts': [{'reasoningEffort': 'high'}]},
+                {'model': 'gpt-6.2-sol', 'isDefault': False, 'defaultReasoningEffort': 'low',
+                 'supportedReasoningEfforts': [{'reasoningEffort': 'low'}, {'reasoningEffort': 'medium'}]},
+            ]}
         if method in ('thread/start', 'thread/resume'):
             return {'thread': {'id': 'thread1'}}
         if method == 'turn/start':
@@ -124,21 +163,31 @@ def wait(agent):
 
 def test_live_contract_streams_persists_and_resumes_without_environment_tools(project):
     service, pid = project
-    agent = AgentManager(service, FakeClient);agent.connect()
-    with pytest.raises(ValueError, match='强度'):
-        agent.send(pid, 'read', 'test-model', 'ultra', ['first'])
-    agent.send(pid, 'read', 'test-model', 'high', ['first']);wait(agent)
+    agent = AgentManager(service, FakeClient)
+    catalog = agent.connect()
+    assert [model['model'] for model in catalog] == ['gpt-6.2-sol']
+    assert catalog[0]['defaultReasoningEffort'] == 'medium'
+    assert catalog[0]['supportedReasoningEfforts'] == [{'reasoningEffort': 'medium'}]
+    agent.send(pid, 'read', 'gpt-6.2-astra', 'high', ['first']);wait(agent)
     start = next(args for method, args in agent.client.calls if method == 'thread/start')
+    assert start['model'] == 'gpt-6.2-sol'
+    assert start['config']['model_reasoning_effort'] == 'medium'
     assert start['environments'] == []
     assert start['approvalPolicy'] == 'never'
     assert start['dynamicTools'] == dynamic_tools()
     turn = next(args for method, args in agent.client.calls if method == 'turn/start')
-    assert turn['effort'] == 'high'
+    assert (turn['model'], turn['effort']) == ('gpt-6.2-sol', 'medium')
     assert json.loads(agent.client.responses[0]['contentItems'][0]['text'])['project_id'] == pid
     assert agent.state(pid)['messages'][-1]['text'] == '已读取两组。'
+    agent._session(pid).update(model='gpt-6.2-astra', effort='low')
+    agent._save(pid)
     restored = AgentManager(service, FakeClient);restored.connect()
+    state = restored.state(pid)
+    assert (state['model'], state['effort']) == ('gpt-6.2-sol', 'medium')
     restored.send(pid, 'continue', 'test-model', 'low', ['first']);wait(restored)
-    assert any(method == 'thread/resume' for method, _ in restored.client.calls)
+    resume = next(args for method, args in restored.client.calls if method == 'thread/resume')
+    assert resume['model'] == 'gpt-6.2-sol'
+    assert resume['config']['model_reasoning_effort'] == 'medium'
     assert restored.state(pid)['busy'] is False
 
 
@@ -400,3 +449,12 @@ def test_global_scope_cannot_run_unscoped_project_actions(project, monkeypatch, 
     with pytest.raises(ValueError, match='独立视频任务'):
         agent._tool(pid, {'tool': 'workbench_' + action, 'callId': 'scope-test',
                          'arguments': {'project_id': pid}}, {pid: ['first']})
+
+
+def test_cleanup_turn_cannot_create_generate_or_modify_unrelated_configuration(project):
+    service, pid = project
+    agent = AgentManager(service)
+    scope = {'projects': {pid: ['first']}, 'cleanup_only': True}
+    for action in ('create_video_jobs', 'review_video_job', 'update_groups', 'prepare_batch', 'start_postproduction'):
+        with pytest.raises(ValueError, match='仅允许检查'):
+            agent._tool(pid, {'tool': 'workbench_' + action, 'callId': 'blocked', 'arguments': {'project_id': pid}}, scope)

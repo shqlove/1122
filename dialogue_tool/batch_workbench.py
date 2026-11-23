@@ -176,12 +176,20 @@ class BatchWorkbenchMixin:
                 results.append({'id': key, 'ok': False, 'message': str(exc)})
         return results
 
-    def workbench_video_approve_batch(self, cards):
+    def workbench_video_approve_batch(self, cards, batch_key=None):
         if not isinstance(cards, list) or not cards or len(cards) > 500:
             raise ValueError('请选择待确认的费用卡')
         queue = self._video_jobs()
         with queue.lock:
             rows = {r['id']: r for r in queue.rows()}
+            if batch_key is not None:
+                expected = [r for r in rows.values() if (r.get('creation_id') or r['batch_id']) == batch_key and r['phase'] != 'canceled' and not r.get('submit_id')]
+                if not expected or {r['id'] for r in expected} != {c['job_id'] for c in cards}:
+                    raise ValueError('本次批次范围已变化，请重新核对完整批次')
+                for row in expected:
+                    siblings = [r for r in rows.values() if r['batch_id'] == row['batch_id'] and r['phase'] != 'canceled']
+                    if sorted(r['part'] for r in siblings) != list(range(1, row['part_count'] + 1)):
+                        raise ValueError('本组分段不完整，不能提交部分视频')
             if len({c['job_id'] for c in cards}) != len(cards):
                 raise ValueError('费用卡重复')
             totals, balances = {}, {}

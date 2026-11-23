@@ -10,6 +10,18 @@ from dialogue_tool import compshare
 from dialogue_tool.h3_errors import H3Error
 
 
+def test_local_path_failures_are_not_reported_as_retryable_network_errors():
+    import errno
+    from dialogue_tool.h3_errors import network_reason
+    windows_error = FileNotFoundError('path too long')
+    windows_error.winerror = 206
+    for error in (windows_error, OSError(errno.ENAMETOOLONG, 'path too long')):
+        code, message, retryable = network_reason(error)
+        assert code == 'path_too_long' and '路径过长' in message and not retryable
+    code, message, retryable = network_reason(FileNotFoundError('missing directory'))
+    assert code == 'file_path_invalid' and not retryable and '本地' in message
+
+
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     monkeypatch.delenv('COMPSHARE_H3_API_KEY', raising=False)

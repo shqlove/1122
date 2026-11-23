@@ -10,6 +10,7 @@ import time
 import uuid
 from pathlib import Path
 
+from .agent_model import AGENT_EFFORT, AGENT_MODEL
 from .agent_transport import AppServerClient
 from .workflow_api import WorkflowAPI, dynamic_tools
 from .settings import resolve_codex
@@ -99,8 +100,6 @@ class AgentManager:
                 # explicitly archived chats untouched. Rebuild transport context
                 # from the merged transcript instead of resuming just one project.
                 messages = []
-                latest = {}
-                latest_time = -1
                 for project in self.service.projects.list():
                     legacy = Path(project['directory']) / 'agent-chat.json'
                     if not legacy.exists():
@@ -110,10 +109,7 @@ class AgentManager:
                         messages.append({**message,
                             'id': f"legacy:{project['id']}:{message.get('id') or index}",
                             'project_id': project['id'], 'project_name': project['name']})
-                    if previous.get('messages') and legacy.stat().st_mtime > latest_time:
-                        latest, latest_time = previous, legacy.stat().st_mtime
-                data = {'messages': sorted(messages, key=lambda m: m.get('time', 0)),
-                        'model': latest.get('model'), 'effort': latest.get('effort')}
+                data = {'messages': sorted(messages, key=lambda m: m.get('time', 0))}
             data.update(busy=False, turn_id=None)
             self.sessions[key] = data
             self.saved_messages[key] = copy.deepcopy(data['messages'])
@@ -183,7 +179,14 @@ class AgentManager:
                     self.client = self.client_factory(executable, Path(__file__).resolve().parent.parent)
                     self.models = []
                 if not self.models:
-                    self.models = self.client.request('model/list', {'includeHidden': False})['data']
+                    catalog = self.client.request('model/list', {'includeHidden': False})['data']
+                    model = next((m for m in catalog if m['model'] == AGENT_MODEL), None)
+                    effort = next((e for e in model.get('supportedReasoningEfforts', [])
+                                   if e['reasoningEffort'] == AGENT_EFFORT), None) if model else None
+                    if not effort:
+                        raise ValueError(f'当前 Codex 连接未提供 {AGENT_MODEL}（{AGENT_EFFORT}）')
+                    self.models = [{**model, 'isDefault': True, 'defaultReasoningEffort': AGENT_EFFORT,
+                                    'supportedReasoningEfforts': [effort]}]
                 return copy.deepcopy(self.models)
             except Exception as exc:
                 self.connection_error = str(exc)
@@ -205,6 +208,7 @@ class AgentManager:
         connected = bool(self.client and not self.client.closed and self.models)
         return {'connected': connected, 'connecting': self.connecting,
                 'connection_error': self.connection_error,
+                'model': AGENT_MODEL, 'effort': AGENT_EFFORT,
                 'models': copy.deepcopy(self.models) if connected else []}
 
     def _stage(self, pid, phase):
@@ -239,6 +243,8 @@ class AgentManager:
         return result
 
     def send(self, pid, text, model, effort, group_ids):
+        # The desktop bridge still accepts model and effort from older clients.
+        # Workbench turns always use the shared settings.
         if not text.strip() or len(text) > 40000:
             raise ValueError('请输入任务（最多 40000 字符）')
         with self.lock:
@@ -246,9 +252,6 @@ class AgentManager:
                 raise ValueError('Agent 正在处理任务，请等待或停止')
             if not self.connection_state()['connected']:
                 raise ValueError('Agent 已断开，请点击重新连接；原任务不会重放')
-            catalog = next((m for m in self.models if m['model'] == model), None)
-            if not catalog or effort not in [e['reasoningEffort'] for e in catalog['supportedReasoningEfforts']]:
-                raise ValueError('请先连接并选择目录中支持的模型与思考强度')
             p = self.service.projects.get(pid)
             scopes = group_ids.get('projects', group_ids) if isinstance(group_ids, dict) else {pid: group_ids}
             for source_id, ids in scopes.items():
@@ -256,13 +259,13 @@ class AgentManager:
                 if len(ids) != len(set(ids)) or not set(ids).issubset({g['id'] for g in source['groups']}):
                     raise ValueError('图片组范围已失效')
             s = self._session(pid)
-            s.update(busy=True, model=model, effort=effort, error=None, turn_id=None,
+            s.update(busy=True, model=AGENT_MODEL, effort=AGENT_EFFORT, error=None, turn_id=None,
                      execution={'started_at': time.time(), 'phase_started': time.time(),
                                 'phase': '准备会话', 'steps': []})
             self.active_project = pid
             self.cancel.clear()
             self._message(pid, 'user', text)
-            threading.Thread(target=self._run, args=(pid, text, model, effort, group_ids), daemon=True).start()
+            threading.Thread(target=self._run, args=(pid, text, group_ids), daemon=True).start()
         return True
 
     def _tool(self, pid, params, scope):
@@ -270,6 +273,8 @@ class AgentManager:
         if not name.startswith('workbench_'):
             raise ValueError('仅允许工作台专用工具')
         action = name[len('workbench_'):]
+        if isinstance(scope, dict) and scope.get('cleanup_only') and action not in ('read_project', 'view_group', 'repair_region', 'record_reference_review'):
+            raise ValueError('本轮仅允许检查、清理与记录参考图片，不允许创建或提交生成')
         args = params['arguments']
         if isinstance(args, str):
             args = json.loads(args)
@@ -328,6 +333,10 @@ class AgentManager:
                 execution.setdefault('steps', []).append({'tool': action, 'seconds': round(time.time() - started, 3)})
             self._stage(pid, '等待模型回复')
         images = result.pop('images', []) if action in ('view_group', 'read_attachment', 'view_video_job') else []
+        if images:
+            # Keep the original file hashes alongside the rendered previews for review tools.
+            result['images'] = [{key: value for key, value in im.items() if key != 'image_url'}
+                                for im in images]
         content = [{'type': 'inputText', 'text': json.dumps(result, ensure_ascii=False)}]
         for im in images:
             content.extend([{'type': 'inputText', 'text': f"视角 {im['side'].upper()}，原图 {im['width']}×{im['height']}"},
@@ -335,15 +344,16 @@ class AgentManager:
         self._message(pid, 'tool', '已完成：' + action, params['callId'])
         return {'contentItems': content, 'success': True}
 
-    def _run(self, pid, text, model, effort, scope):
+    def _run(self, pid, text, scope):
         try:
             self.connect()
             # Events from catalog/previous completed turns must not finish this turn.
             while not self.client.events.empty(): self.client.events.get_nowait()
             s = self._session(pid)
-            common = {'model': model, 'environments': [], 'approvalPolicy': 'never',
+            common = {'model': AGENT_MODEL, 'environments': [], 'approvalPolicy': 'never',
                       'baseInstructions': INSTRUCTIONS, 'developerInstructions': '只能调用工作台专用工具。',
-                      'config': {'web_search': 'disabled'}, 'sandbox': 'read-only'}
+                      'config': {'web_search': 'disabled', 'model_reasoning_effort': AGENT_EFFORT},
+                      'sandbox': 'read-only'}
             tools = dynamic_tools()
             tool_signature = hashlib.sha256((json.dumps(tools, sort_keys=True) + INSTRUCTIONS).encode()).hexdigest()
             history_context = ''
@@ -379,8 +389,8 @@ class AgentManager:
                 project_scopes = scope.get('projects', scope)
                 context = {'allowed_item_ids': scope.get('item_ids'), 'allowed_scopes': [{'project_id': key, 'project_name': self.service.projects.get(key)['name'], 'allowed_group_ids': ids} for key, ids in project_scopes.items()], 'note': '本轮范围来自总览勾选。每次工具调用显式传 project_id，逐组检查、逐项目处理；某组失败报告后继续其他组。不修改范围外素材，不自动批准费用。'}
             self._stage(pid, '等待模型回复')
-            result = self.client.request('turn/start', {'threadId': s['thread_id'], 'model': model,
-                'effort': effort, 'environments': [],
+            result = self.client.request('turn/start', {'threadId': s['thread_id'], 'model': AGENT_MODEL,
+                'effort': AGENT_EFFORT, 'environments': [],
                 'input': [{'type': 'text', 'text': history_context + '工作台上下文：' + json.dumps(context, ensure_ascii=False) + '\n用户任务：\n' + text}]})
             with self.lock:
                 s['turn_id'] = result['turn']['id']
@@ -453,7 +463,7 @@ class AgentManager:
             old = self._session(pid)
             if old['messages']:
                 self._path(pid).with_name(f'agent-chat-{time.time_ns()}.json').write_text(json.dumps(old, ensure_ascii=False), encoding='utf-8')
-            self.sessions['workspace'] = {'messages': [], 'busy': False, 'model': old.get('model'), 'effort': old.get('effort'),
+            self.sessions['workspace'] = {'messages': [], 'busy': False, 'model': AGENT_MODEL, 'effort': AGENT_EFFORT,
                                   'chat_id': uuid.uuid4().hex}
             self._save(pid, new_chat=True)
         return True

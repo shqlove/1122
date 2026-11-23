@@ -54,6 +54,133 @@ def test_history_links_and_acceptance_are_distinct(wb):
         api.workbench_review(item['id'], True)
 
 
+def test_library_shows_verified_publication_after_cleanup_and_reexport(wb):
+    api, _, post_root, source, output = wb
+    manifest_path = post_root / 'batches' / 'batch1' / 'manifest.json'
+    manifest = read_json(manifest_path)
+    original = manifest['jobs'][0]
+    original['sourceSha256'] = hashlib.sha256(source.read_bytes()).hexdigest()
+    revised = output.with_name('reexported.mp4')
+    revised.write_bytes(b'changed export, same source')
+    manifest['jobs'].append({**original, 'id': 'reexport', 'output': str(revised),
+                             'outputSha256': hashlib.sha256(revised.read_bytes()).hexdigest()})
+    unrelated = output.with_name('unrelated.mp4')
+    unrelated.write_bytes(b'other source and export')
+    manifest['jobs'].append({**original, 'id': 'unrelated', 'output': str(unrelated),
+                             'outputSha256': hashlib.sha256(unrelated.read_bytes()).hexdigest(),
+                             'sourceSha256': hashlib.sha256(b'another source').hexdigest()})
+    save_json(manifest_path, manifest)
+    history_path = api._service.projects.root / 'douyin-publish' / 'batches'
+    media = {'slot': '01', 'uid': 'original-phone', 'account': '测试账号', 'filename': 'IMG_0017.MOV',
+             'media_sha256': original['outputSha256']}
+    save_json(history_path / ('1' * 32 + '.json'),
+              {'id': '1' * 32, 'mode': 'publish', 'status': 'finished', 'created': 10,
+               'rows': [{**media, 'status': 'published', 'updated': 12}]})
+    save_json(history_path / ('2' * 32 + '.json'),
+              {'id': '2' * 32, 'mode': 'cleanup', 'status': 'finished', 'created': 20,
+               'rows': [{**media, 'status': 'published', 'cleanup_status': 'deleted'}]})
+
+    posts = {item['job_id']: item for item in api.workbench_library()['items'] if item['kind'] == 'post'}
+    for job_id in ('job1', 'reexport'):
+        destination = posts[job_id]['publication']
+        assert (destination['status'], destination['slot'], destination['account']) == ('published', '01', '测试账号')
+        assert destination['published_at'] == 12
+        assert destination['cleanup_status'] == 'deleted'
+    assert posts['unrelated']['publication'] is None
+
+
+@pytest.mark.parametrize('status,label', [('failed','失败'), ('canceled','已取消'), ('cancelled','已取消'), ('completed_no_resource','失败')])
+def test_terminal_platform_status_takes_precedence_over_queue_attention(wb, monkeypatch, status, label):
+    api, _, _, _, _ = wb
+    monkeypatch.setattr(api, 'workbench_library', lambda: {'items': [{
+        'id':'job', 'kind':'generation', 'model':'MiniMax-H3', 'status':status,
+        'queue_phase':'attention', 'submit_id':'original', 'available':False,
+        'tracking':{'retry_exhausted':True}}]})
+    row = api.workbench_tasks()['items'][0]
+    assert row['category'] == 'failed' and row['status_label'] == label
+
+
+@pytest.mark.parametrize('historical', [False, True])
+def test_legacy_resume_queries_original_round_and_preserves_other_rounds(wb, monkeypatch, historical):
+    import copy
+    import io
+    from dialogue_tool import compshare
+    api, p, _, _, _ = wb
+    cfg = {'model':'MiniMax-H3', 'duration':15, 'submitted_at':10, 'global_prompt':'original',
+           'tasks':{'g1':{'group_id':'g1', 'submit_id':'old-submit', 'task_id':'old-platform', 'status':'running',
+                          'request_snapshot':{'bound_prompt':'immutable prompt'}}}}
+    cfg['dialogue_plans'] = {'g1': {'source_group_id':'g1', 'parts':[{'group_id':'g1','index':1}],
+                                   'assembly':{'order':['g1']}}}
+    unrelated = {'model':'MiniMax-H3', 'tasks':{'g1':{'submit_id':'other-submit', 'task_id':'other-platform', 'status':'running'}}}
+    p['generation'] = copy.deepcopy(unrelated if historical else cfg)
+    p['generation_history'] = [copy.deepcopy(cfg if historical else unrelated)]
+    api._service.projects.save(p)
+    key = next(i['id'] for i in api.workbench_tasks()['items'] if i.get('submit_id')=='old-submit')
+    calls = []
+    def request(client, method, path, *args, **kwargs):
+        assert method == 'GET' and path == 'query/video_generation/old-platform'
+        calls.append(path)
+        return {'task':{'id':'old-platform','status':'succeeded','content':{'url':'https://example.invalid/result.mp4'}}}
+    monkeypatch.setattr(compshare.H3Client, 'request', request)
+    monkeypatch.setattr(compshare, 'urlopen', lambda *a, **k: io.BytesIO(b'video'))
+    monkeypatch.setattr(compshare, 'probe', lambda *a: {'format':{'duration':15}, 'streams':[
+        {'codec_type':'video','width':128,'height':72},{'codec_type':'audio'}]})
+    def assemble(service, scoped):
+        assert scoped['generation']['tasks']['g1']['submit_id'] == 'old-submit'
+        scoped['generation']['dialogue_plans']['g1']['assembly'].update(
+            status='assembled', output=scoped['generation']['tasks']['g1']['output'], duration=15)
+        service.projects.save(scoped)
+    monkeypatch.setattr('dialogue_tool.segment_assembly.assemble_segments', assemble)
+    api.workbench_legacy_resume(key)
+    after = api._service.projects.get(p['id'])
+    selected = after['generation_history'][0] if historical else after['generation']
+    untouched = after['generation'] if historical else after['generation_history'][0]
+    assert untouched == unrelated
+    assert selected['tasks']['g1']['status'] == 'downloaded'
+    assert selected['tasks']['g1']['submit_id'] == 'old-submit'
+    assert selected['tasks']['g1']['request_snapshot'] == cfg['tasks']['g1']['request_snapshot']
+    assert selected['dialogue_plans']['g1']['assembly']['status'] == 'assembled'
+    assert len(calls) == 2 and Path(selected['tasks']['g1']['output']).is_file()
+    api.workbench_legacy_resume(key)
+    assert len(calls) == 2, 'Already downloaded task must not query or download again'
+
+
+@pytest.mark.parametrize('status,task_id', [('audio_completed','platform'), ('running',None)])
+def test_legacy_resume_cannot_advance_audio_or_replay_unknown_submission(wb, monkeypatch, status, task_id):
+    from dialogue_tool.compshare import H3Client
+    api, p, _, _, _ = wb
+    p['generation']['tasks']['g1'] = {'group_id':'g1', 'submit_id':'old', 'task_id':task_id, 'status':status}
+    api._service.projects.save(p)
+    key = next(i['id'] for i in api.workbench_tasks()['items'] if i.get('submit_id')=='old')
+    monkeypatch.setattr(H3Client, 'request', lambda *a, **k: pytest.fail('Must not reach provider'))
+    with pytest.raises(ValueError):
+        api.workbench_legacy_resume(key)
+    assert api._service.projects.get(p['id']) == p
+
+
+def test_legacy_query_failure_still_downloads_successful_sibling(wb, monkeypatch):
+    from dialogue_tool.compshare import H3Client, CompShareWorkflow
+    from dialogue_tool.h3_errors import H3Error
+    api, p, _, source, _ = wb
+    p['generation']['tasks'] = {gid: {'group_id':gid, 'submit_id':gid, 'task_id':gid, 'status':'running'}
+                                for gid in ('bad','good')}
+    api._service.projects.save(p)
+    key = next(i['id'] for i in api.workbench_tasks()['items'] if i.get('submit_id')=='bad')
+    def request(client, method, path, *args, **kwargs):
+        assert method == 'GET'
+        if path.endswith('/bad'):
+            raise H3Error('timeout', 'temporary query failure', retryable=True)
+        return {'task': {'id':'good', 'status':'succeeded'}}
+    monkeypatch.setattr(H3Client, 'request', request)
+    monkeypatch.setattr(CompShareWorkflow, '_download_task', lambda self, p, cfg, task:
+                        task.update(status='downloaded', output=str(source)))
+    with pytest.raises(H3Error, match='temporary'):
+        api.workbench_legacy_resume(key)
+    tasks = api._service.projects.get(p['id'])['generation']['tasks']
+    assert tasks['good']['status'] == 'downloaded' and tasks['bad']['status'] == 'running'
+    assert tasks['bad']['submit_id'] == 'bad' and tasks['good']['submit_id'] == 'good'
+
+
 def test_my_tasks_includes_history_and_uses_submission_snapshot(wb):
     import copy
     api,p,_,source,_=wb

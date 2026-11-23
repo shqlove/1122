@@ -73,6 +73,60 @@ class DesktopAPI(WorkbenchMixin):
         self._h3_verified_key = None
         self._migrate_media_trash()
         self._video_jobs()
+        from .douyin_publish import DouyinPublish
+        self._douyin = DouyinPublish(service.projects.root, postprocess_root=self._post_root())
+
+    def _phone_distribution(self):
+        from .phone_distribution import PhoneDistribution
+        return PhoneDistribution(self._service.projects.root, postprocess_root=self._post_root())
+
+    def phone_distribution_state(self):
+        return self._phone_distribution().state()
+
+    def phone_distribution_start(self, assignments):
+        library = {item['id']: item for item in self.workbench_library()['items']}
+        return self._phone_distribution().start(assignments, library)
+
+    def phone_distribution_resume(self, key, resend=False):
+        return self._phone_distribution().resume(key, resend)
+
+    def douyin_publish_state(self):
+        return self._douyin.state()
+
+    def _start_douyin(self, method, *args):
+        from .douyin_agent import run_batch
+        from .settings import resolve_codex
+
+        codex = resolve_codex(self._service.config.get('codex'))
+        if not codex:
+            raise ValueError('未找到 Codex，请在工作台设置里检查连接')
+        batch = method(*args)
+        worker = threading.Thread(target=run_batch, args=(self._douyin, batch, codex), daemon=True)
+        try:
+            worker.start()
+        except Exception:
+            self._douyin.end(batch['id'], '抖音任务未能启动')
+            raise
+        return batch
+
+    def douyin_publish_start(self):
+        slots = list(self._douyin.distribution.bindings())
+        return self._start_douyin(self._douyin.begin, slots)
+
+    def douyin_publish_confirm(self, batch_id, delete_after=False):
+        return self._start_douyin(self._douyin.confirm, batch_id, delete_after)
+
+    def douyin_cleanup_state(self):
+        return self._douyin.cleanup_state()
+
+    def douyin_cleanup_start(self, selection_ids):
+        return self._start_douyin(self._douyin.begin_cleanup, selection_ids)
+
+    def douyin_auto_cleanup_state(self):
+        return self._douyin.cleanup_state()
+
+    def douyin_auto_cleanup_start(self):
+        return self._start_douyin(self._douyin.begin_auto_cleanup)
 
     def get_state(self):
         with self.lock:

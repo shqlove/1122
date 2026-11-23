@@ -21,6 +21,21 @@ class CanvasError(RuntimeError):
     pass
 
 
+def download_folder(project, task):
+    """Keep provider downloads inside their project without repeated long IDs."""
+    folder = Path(project['directory']) / 'generated-videos' / task['group_id']
+    if task.get('submit_id'):
+        folder /= task['submit_id']
+    # Independent queue projects already include batch + job in their path.
+    # Retain short legacy locations and existing outputs; only new downloads
+    # need this compact, deterministic per-submission directory.
+    if project.get('video_job') or len(str(folder / 'video.partial')) >= 240:
+        identity = json.dumps([project['id'], task['group_id'],
+                               task.get('submit_id') or task.get('resource_id')], ensure_ascii=False)
+        folder = Path(project['directory']) / 'v' / hashlib.sha256(identity.encode()).hexdigest()[:32]
+    return folder
+
+
 def _data(envelope):
     if not isinstance(envelope, dict):
         raise CanvasError("即梦 CLI 未返回有效 JSON")
@@ -42,7 +57,12 @@ def invoke(cli, args, timeout=120):
                               errors='replace', timeout=timeout, check=False,
                               creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
     except (OSError, subprocess.TimeoutExpired) as exc:
-        raise CanvasError("即梦命令未确认成功；若是写操作，请先核查已有任务，不要直接重提") from exc
+        error = CanvasError("即梦命令未确认成功；若是写操作，请先核查已有任务，不要直接重提")
+        # Preserve transient read failures through download()'s aggregate error.
+        # A timed-out write must never acquire automatic retry permission.
+        error.retryable = (tuple(args[:2]) in (('operation', 'status'), ('resource', 'get'), ('resource', 'download'))
+                           and isinstance(exc, (subprocess.TimeoutExpired, TimeoutError, ConnectionError)))
+        raise error from exc
     # CLI failures use stderr for JSON; successful responses use stdout.
     payload = done.stdout.strip() or getattr(done, 'stderr', '').strip()
     try:
@@ -550,9 +570,7 @@ class CanvasWorkflow:
             raise CanvasError('成片缺少资源ID，请继续查询原任务')
         rid = task["resource_id"]
         invoke(self.cli, ["resource", "get", rid, "--project-id", cfg["project_id"]])
-        folder = Path(project["directory"]) / "generated-videos" / task["group_id"]
-        if task.get('submit_id'):
-            folder = folder / task['submit_id']
+        folder = download_folder(project, task)
         folder.mkdir(parents=True, exist_ok=True)
         response = invoke(self.cli, ["resource", "download", rid,
                                      "--project-id", cfg["project_id"], "--output", str(folder)],

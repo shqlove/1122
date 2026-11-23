@@ -249,6 +249,32 @@ def test_download_checks_media_before_completion(setup, monkeypatch):
     assert task['status']=='downloaded' and Path(task['output']).is_file()
 
 
+@pytest.mark.parametrize('queue_job', [False, True])
+def test_download_long_project_path_uses_short_unique_storage(setup, monkeypatch, queue_job):
+    import io
+    api, pid, service, calls = setup
+    p = service.projects.get(pid)
+    p['directory'] = str(Path(service.config['data']) / ('b' * 32) / ('j' * 32) / ('x' * 32))
+    if queue_job:
+        p['video_job'] = {'batch_id': 'batch'}
+    original_submit = 'original-submit-' + 's' * 20
+    task = {'group_id': 'g' * 32, 'submit_id': original_submit, 'task_id': 'task-1'}
+    monkeypatch.setattr(compshare, 'urlopen', lambda *a, **kw: io.BytesIO(b'video'))
+    monkeypatch.setattr(compshare, 'probe', lambda *a: {'format': {'duration': 10}, 'streams': [
+        {'codec_type': 'video', 'width': 640, 'height': 480}, {'codec_type': 'audio'}]})
+    api.flow.h3._download_task(p, p['generation'], task)
+    first = Path(task['output'])
+    assert first.read_bytes() == b'video' and len(str(first)) < 240
+    assert first.is_relative_to(Path(p['directory']) / 'v')
+    assert task['submit_id'] == original_submit and task['task_id'] == 'task-1'
+    api.flow.h3._download_task(p, p['generation'], task)
+    assert Path(task['output']) == first
+    task['submit_id'] = 'another-submission'
+    api.flow.h3._download_task(p, p['generation'], task)
+    assert Path(task['output']) != first and first.is_file()
+    assert all(call[0] == 'GET' for call in calls)
+
+
 def test_one_query_failure_preserves_other_tasks_progress(setup, monkeypatch):
     from dialogue_tool.h3_errors import H3Error
     api, pid, service, _ = setup

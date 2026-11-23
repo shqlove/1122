@@ -128,6 +128,8 @@ def test_resume_does_not_repeat_successful_codex_batches(tmp_path, register_pyth
     counter = tmp_path / 'calls.txt'
     executable = tmp_path / 'fake-codex'
     executable.write_text('#!/usr/bin/env python3\n' + f'''import sys,json,pathlib
+assert sys.argv[sys.argv.index('--model') + 1] == 'gpt-6.2-sol'
+assert 'model_reasoning_effort="medium"' in sys.argv
 counter=pathlib.Path({str(counter)!r})
 n=int(counter.read_text())+1 if counter.exists() else 1
 counter.write_text(str(n))

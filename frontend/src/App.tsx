@@ -28,6 +28,7 @@ import {
   Scissors,
   Trash2,
   RotateCcw,
+  Wrench,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -42,8 +43,13 @@ import {
   DialogDescription,
 } from "@/components/ui/dialog";
 import { api, backendReady } from "./lib/api";
-import { VideoStudio, selectVideoSource, selectVideoSources } from "./VideoStudio";
+import { VideoStudio, selectVideoSource, selectVideoSources, resumeVideoBatch, editVideoDraft } from "./VideoStudio";
 import { MyTasks } from "./MyTasks";
+import { PhoneDistribution, type DistributionMedia } from "./PhoneDistribution";
+import { PublicationDestination } from "./Publication";
+import { DouyinPublish } from "./DouyinPublish";
+import { PublishedCleanup } from "./PublishedCleanup";
+import { VideoProgress } from "./VideoProgress";
 
 const Context = createContext<any>(null);
 const useApp = () => useContext(Context);
@@ -87,11 +93,16 @@ const pages = [
   ["library", "成片库", Library],
   ["projects", "导入与拆解", FolderOpen],
   ["groups", "来源图片组", FolderOpen],
+  ["skills", "技能大全", Wrench],
 ] as const;
 const statusNames: any = {
   downloaded: "已下载",
   complete: "已导出",
-  completed: "生成完成",
+  completed: "平台已生成 · 待下载",
+  retry_wait: "后台自动重试",
+  downloading: "正在下载",
+  assembling: "正在合并",
+  stale: "状态待同步",
   running: "处理中",
   submitted: "已提交",
   failed: "失败",
@@ -351,6 +362,9 @@ export default function App() {
   };
   const name =
     page === "settings" ? "设置" : pages.find((x) => x[0] === page)?.[1];
+  const playbackPublication = media?.kind === "post"
+    ? lib.items.find((item: any) => item.id === media.id)?.publication ?? media.publication
+    : undefined;
   return (
     <Context.Provider value={value}>
       <div className="app-shell">
@@ -399,7 +413,7 @@ export default function App() {
               <strong>{name}</strong>
             </div>
             <div className="top-actions">
-              {["overview", "raw", "generate", "tasks", "post", "library"].includes(page) ? <Badge variant="secondary">{page === "generate" ? "独立视频任务" : page === "tasks" ? "全部项目 · 提交记录" : "全部项目 · 素材总览"}</Badge> : <Select
+              {page === "skills" ? null : ["overview", "raw", "generate", "tasks", "post", "library"].includes(page) ? <Badge variant="secondary">{page === "generate" ? "独立视频任务" : page === "tasks" ? "全部项目 · 提交记录" : "全部项目 · 素材总览"}</Badge> : <Select
                 aria-label="当前项目"
                 value={p?.id || ""}
                 disabled={working || state.navigation_busy}
@@ -427,15 +441,15 @@ export default function App() {
           </header>
           <div className="body-row">
             <main className={["overview","raw"].includes(page)?"main-content overview-main":"main-content"} ref={mainRef}>
-              <div className="page-heading">
-                <div className="eyebrow">
+              <div className="page-heading" hidden={page === "generate"}>
+                {page !== "skills" && <div className="eyebrow">
                   {page === "settings"
                     ? "WORKSPACE SETTINGS"
                     : page === "overview" ? "ALL PROJECTS / 素材总览"
                     : page === "raw" ? "ORIGINAL VIDEOS / 原片库"
                     : page === "tasks" ? "TASK HISTORY / 全部提交"
                     : `WORKFLOW / ${{projects:'01',groups:'02',generate:'03',post:'04',library:'05'}[page]}`}
-                </div>
+                </div>}
                 <h1>{name}</h1>
                 <p>
                   {
@@ -449,6 +463,7 @@ export default function App() {
                       tasks: "每一次提交都有记录，随时查看进度、提示词与生成视频。",
                       post: "为原片添加字幕、空间效果和背景音乐。",
                       library: "所有交付版本，在这里预览、核对和验收。",
+                      skills: "运行已接入工作台的技能，查看每次执行结果。",
                       settings: "管理本机连接、共享音色与后期配置。",
                     }[page]
                   }
@@ -482,14 +497,15 @@ export default function App() {
               ) : page === "groups" ? (
                 <Groups />
               ) : page === "generate" ? (
-                <><VideoStudio initialProjectId={p?.id} initialGroupIds={selected} onOpenTasks={() => setPage('tasks')} />
-                {!!Object.keys(p?.generation?.tasks || {}).length && <details style={{marginTop:24}}><summary>旧版项目任务（保留原记录）</summary><Generate key={p?.id || "none"} /></details>}</>
+                <VideoStudio initialProjectId={p?.id} initialGroupIds={selected} onOpenTasks={() => setPage('tasks')} onOpenRaw={() => setPage('raw')} />
               ) : page === "tasks" ? (
-                <MyTasks onGenerate={() => setPage('generate')} />
+                <MyTasks onGenerate={() => {selectVideoSources([]); setPage('generate');}} onResume={(id:string) => {resumeVideoBatch(id); setPage('generate');}} onEdit={(draft:any) => {editVideoDraft(draft); setPage('generate');}} />
               ) : page === "post" ? (
                 <Post />
               ) : page === "library" ? (
                 <LibraryPage />
+              ) : page === "skills" ? (
+                <SkillsPage connected={ready} />
               ) : (
                 <SettingsPage />
               )}
@@ -521,6 +537,7 @@ export default function App() {
             </Action>
           </div>
           {media.review_note && <p className="notice">{media.review_note}</p>}
+          {playbackPublication && <PublicationDestination publication={playbackPublication} details />}
           <p className="path">{media.path}</p>
         </Modal>
       )}
@@ -594,7 +611,7 @@ function Overview() {
     await act(async () => {
       await api("workbench_select_global_groups", pid, ids);
       await api("select_project", pid);
-      await api("agent_send", "请只处理本次指定的图片组：逐图检查，去除水印和叠加字幕，修复后复看并记录检查结果。没有水印字幕的图片跳过。不要生成视频，不修改提示词或音色。", agent.model || "", agent.effort || "low", ids, pid);
+      await api("agent_send", "请只处理本次指定的图片组：逐图检查，去除水印和叠加字幕，修复后复看并记录检查结果。没有水印字幕的图片跳过。不要生成视频，不修改提示词或音色。", agent.model, agent.effort, ids, pid);
       setPanel(true);
       return true;
     }).then(async (ok: any) => { if (ok) await goSource({project_id: pid}, "groups"); });
@@ -632,7 +649,7 @@ function Overview() {
         {view.filter === "trash" ? <Button disabled={!pickedGroups.length || operating} onClick={()=>setBatchAction('restore')}>恢复所选图片组</Button> : <>
           <Button disabled={!pickedGroups.length || operating} onClick={()=>startVideos(pickedGroups)}>生成所选 {pickedGroups.length} 组视频</Button>
           <Button variant="outline" disabled={!pickedGroups.length || operating} onClick={()=>setBatchAction('confirm')}>批量确认可用</Button>
-          <Button variant="outline" disabled={!pickedGroups.length || operating || agent.busy || !agent.connected} onClick={()=>act(async()=>{await api('agent_send_global','请逐组检查本次范围，去除水印和叠加字幕，修复后复看并记录 SHA 检查。没有则跳过。不生成视频，不修改提示词和音色。某组失败继续其他组，最后汇总。',agent.model || '',agent.effort || 'low',pickedGroups);setPanel(true);})}>批量去水印 / 字幕</Button>
+          <Button variant="outline" disabled={!pickedGroups.length || operating || agent.busy || !agent.connected} onClick={()=>act(async()=>{await api('agent_send_global','请逐组检查本次范围，去除水印和叠加字幕，修复后复看并记录 SHA 检查。没有则跳过。不生成视频，不修改提示词和音色。某组失败继续其他组，最后汇总。',agent.model,agent.effort,pickedGroups);setPanel(true);})}>批量去水印 / 字幕</Button>
           <Button variant="ghost" disabled={!pickedGroups.length || operating} onClick={()=>setBatchAction('trash')}>移入回收站</Button>
         </>}
 
@@ -1756,7 +1773,7 @@ function MediaGrid({ items, picked = [], setPicked, final = false, onDetails, so
           >
             <Poster item={v} />
             <span className="play-icon">
-              <Play size={22} />
+              {v.available ? <Play size={22} /> : <Clock size={22} />}
             </span>
             <span className="cover-label">
               {v.kind === "post" ? "FINAL CUT" : v.kind === "assembly" ? "合并原片 · 未做后期" : v.model || "GENERATED VIDEO"}
@@ -1772,7 +1789,7 @@ function MediaGrid({ items, picked = [], setPicked, final = false, onDetails, so
                   <input
                     type="checkbox"
                     disabled={
-                      v.kind === "post" ? !v.source_path : v.kind === "assembly" ? !v.available : !v.archive_path
+                      v.kind === "post" ? !v.available : v.kind === "assembly" ? !v.available : !v.archive_path
                     }
                     checked={picked.includes(v.id)}
                     onChange={(e) =>
@@ -1786,11 +1803,13 @@ function MediaGrid({ items, picked = [], setPicked, final = false, onDetails, so
                 )}
                 <strong>{v.label || `第 ${String(v.group_number).padStart(2, "0")} 组`}</strong>
               </label>
-              <Status value={v.status} accepted={v.accepted} />
+              <Status value={["retry_wait","downloading","assembling"].includes(v.queue_phase)?v.queue_phase:v.tracking?.stale?"stale":v.status} accepted={v.accepted} />
             </div>
             <p className="clamp" title={v.project_name}>
               {v.project_name}
             </p>
+            {final && v.path && <small className="block break-all" title={v.path}>{v.path.split(/[\\/]/).pop()}</small>}
+            {final && v.publication && <PublicationDestination publication={v.publication} />}
             <small>
               {v.kind === "post"
                 ? v.profile
@@ -1800,13 +1819,14 @@ function MediaGrid({ items, picked = [], setPicked, final = false, onDetails, so
               {v.kind !== "post"
                 ? v.round === -1
                   ? "当前轮次"
-                  : `历史第 ${v.round + 1} 轮`
+                  : v.round==null?"独立任务":`历史第 ${v.round + 1} 轮`
                 : "导出版本"}
               {v.created_at
                 ? " · " + new Date(v.created_at * 1000).toLocaleString()
                 : ""}
               {v.submit_id ? " · " + v.submit_id.slice(0, 8) : ""}
             </div>
+            {v.job_id && <VideoProgress row={v}/>}
             {v.error && (
               <p className="error-text">
                 {typeof v.error === "string"
@@ -2085,8 +2105,17 @@ function BatchMediaActions({ids,clear,trash=false,final=false}:any) {
   </Modal>}</>;
 }
 
+function SkillsPage({ connected }: { connected: boolean }) {
+  const [publishing, setPublishing] = useState(false);
+  const [cleaning, setCleaning] = useState(false);
+  return <DouyinPublish connected={connected} peerBusy={cleaning} onOwnBusy={setPublishing}>
+    <PublishedCleanup connected={connected} peerBusy={publishing} onOwnBusy={setCleaning} />
+  </DouyinPublish>;
+}
+
 function LibraryPage() {
   const { lib, p } = useApp();
+  const [phoneDialog, setPhoneDialog] = useState<{itemIds: string[], history: boolean} | null>(null);
   const [picked,setPicked] = useState<string[]>([]);
   const [filter, setFilter] = useState("all"),
     [search, setSearch] = useState("");
@@ -2100,6 +2129,9 @@ function LibraryPage() {
         (filter === "project" && v.project_id === p?.id)) &&
       `${v.project_name} ${v.group_number}`.includes(search),
   );
+  const libraryById = new Map<string, DistributionMedia>(lib.items.map((item: DistributionMedia) => [item.id, item]));
+  const selectedPublished = picked.filter(id => libraryById.get(id)?.publication?.status === "published").length;
+  const countForPhone = picked.length - selectedPublished;
   return (
     <>
       <div className="toolbar">
@@ -2124,6 +2156,16 @@ function LibraryPage() {
       </p>
       <div className="batch-toolbar"><Button variant="outline" onClick={()=>setPicked(items.map((v:any)=>v.id))}>选择筛选结果</Button><Button variant="ghost" onClick={()=>setPicked([])}>清空选择</Button><span>已选 {picked.length} 条</span></div>
       <BatchMediaActions ids={picked} clear={()=>setPicked([])} final trash={filter==='trash'}/>
+      {filter !== "trash" && <div className="batch-toolbar">
+        <Button disabled={!countForPhone} onClick={() => setPhoneDialog({itemIds: picked, history: false})}>
+          <Send size={16} />为所选 {countForPhone} 条成片选择手机
+        </Button>
+        <Button variant="outline" onClick={() => setPhoneDialog({itemIds: [], history: true})}>分发记录</Button>
+        {!!selectedPublished && <small className="muted">{selectedPublished} 条成片已发布，已从手机分发范围排除。</small>}
+      </div>}
+      {phoneDialog && <Modal title={phoneDialog.history ? "手机分发记录" : "选择接收手机"} description={phoneDialog.history ? "按操作时间查看每条成片的目标手机与处理结果。" : "逐条勾选接收手机，同一条成片可以发到两台。"} wide onClose={() => setPhoneDialog(null)}>
+        <PhoneDistribution items={phoneDialog.itemIds.map(id => libraryById.get(id) || {id})} history={phoneDialog.history} />
+      </Modal>}
       <MediaGrid items={items} picked={picked} setPicked={setPicked} final />
     </>
   );
@@ -2291,10 +2333,8 @@ function AgentPanel({ hidden }: any) {
   const globalScope = ["overview","raw"].includes(page);
   const globalVideos = globalScope && overview.tab==='videos';
   const selectedGlobal = globalVideos ? (lib.items || []).filter((v:any)=>overview.videos.includes(v.id) && !v.trashed).flatMap((v:any)=>(v.group_ids || [v.group_id]).filter(Boolean).map((group_id:string)=>({project_id:v.project_id,group_id}))) : (lib.groups || []).filter((g:any)=>overview.picked.includes(g.id) && !g.trashed);
+  const { model, effort } = agent;
   const [text, setText] = useState(""),
-    [models, setModels] = useState<any[]>([]),
-    [model, setModel] = useState(""),
-    [effort, setEffort] = useState("low"),
     [attachments, setAttachments] = useState<any[]>([]);
   // Attachments belong to a project; the conversation and unsent text do not.
   useEffect(() => {
@@ -2304,26 +2344,6 @@ function AgentPanel({ hidden }: any) {
   useEffect(() => {
     bottom.current?.scrollIntoView({ block: "nearest" });
   }, [agent.messages?.length, agent.busy]);
-  const catalogKey = JSON.stringify(agent.models || []);
-  useEffect(() => {
-    const available = agent.models || [];
-    if (!available.length) return;
-    setModels(available);
-    const chosen =
-      available.find((v: any) => v.model === model) ||
-      available.find((v: any) => v.model === agent.model) ||
-      available.find((v: any) => v.isDefault) ||
-      available[0];
-    const preferredEffort = model ? effort : agent.effort;
-    setModel(chosen.model);
-    setEffort(
-      chosen.supportedReasoningEfforts?.some(
-        (v: any) => v.reasoningEffort === preferredEffort,
-      )
-        ? preferredEffort
-        : chosen.defaultReasoningEffort || "low",
-    );
-  }, [catalogKey]);
   const connect = () => act(() => api("agent_models"));
   return (
     <aside className={hidden ? "agent-panel closed" : "agent-panel"}>
@@ -2371,38 +2391,10 @@ function AgentPanel({ hidden }: any) {
             重新连接 Agent
           </Button>
         )}
-        {models.length > 0 && (
-          <>
-            <Select
-              aria-label="Agent 模型"
-              value={model}
-              onChange={(e: any) => {
-                setModel(e.target.value);
-                setEffort(
-                  models.find((v) => v.model === e.target.value)
-                    ?.defaultReasoningEffort || "low",
-                );
-              }}
-            >
-              {models.map((v) => (
-                <option value={v.model} key={v.model}>
-                  {v.displayName || v.model}
-                </option>
-              ))}
-            </Select>
-            <Select
-              aria-label="推理强度"
-              value={effort}
-              onChange={(e: any) => setEffort(e.target.value)}
-            >
-              {(
-                models.find((v) => v.model === model)
-                  ?.supportedReasoningEfforts || []
-              ).map((v: any) => (
-                <option key={v.reasoningEffort}>{v.reasoningEffort}</option>
-              ))}
-            </Select>
-          </>
+        {model && effort && (
+          <Badge variant="outline">
+            {model} · {effort === "medium" ? "中等" : effort}
+          </Badge>
         )}
       </div>
       {!agent.connected && agent.connection_error && (

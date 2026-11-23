@@ -1,6 +1,7 @@
 """Project-linked media library and explicit, resumable postproduction jobs."""
 from __future__ import annotations
 
+from .agent_model import AGENT_EFFORT, AGENT_MODEL
 from .dialogue_segments import has_tasks
 
 import hashlib
@@ -55,7 +56,10 @@ def media_identity(kind, project_id, group_id, record, fallback):
     return f"{kind}:{project_id}:{digest}:{group_id or ''}"
 
 
-class WorkbenchMixin(BatchWorkbenchMixin):
+from .studio_workbench import StudioWorkbenchMixin
+
+
+class WorkbenchMixin(StudioWorkbenchMixin, BatchWorkbenchMixin):
     def _migrate_media_trash(self):
         # Run on application startup, never from the read-only library/task view.
         from .project_run import workflow_lock
@@ -83,9 +87,11 @@ class WorkbenchMixin(BatchWorkbenchMixin):
 
     def workbench_video_sources(self):
         trash = trash_records(self._service)
-        return [{'id': p['id'], 'name': p['name'], 'groups': [
+        return [{'id': p['id'], 'name': p['name'], 'created_at': p.get('created_at'), 'groups': [
             {'id': g['id'], 'number': i, 'needs_review': bool(g.get('needs_review')),
              'voice': g.get('generation_bindings', {}).get('voice_name'),
+             'person_a': g.get('person_a'), 'person_b': g.get('person_b'),
+             'cleanup': self._studio_group_check(p, g),
              'selected': g.get('selected', False)} for i, g in enumerate(p.get('groups', []), 1) if group_key(p['id'], g['id']) not in trash]}
             for p in self._service.projects.list()]
 
@@ -133,6 +139,8 @@ class WorkbenchMixin(BatchWorkbenchMixin):
                     ref['url'] = media_url(ref['path'])
             if row['output'] and Path(row['output']).is_file():
                 row['url'] = media_url(row['output'])
+            if row.get('complete_output'):
+                row['complete_url'] = media_url(row['complete_output'])
         return rows
 
     def workbench_video_approve(self, job_id, card_id, ceiling):
@@ -311,7 +319,12 @@ class WorkbenchMixin(BatchWorkbenchMixin):
         review_path = self._service.projects.root / 'workbench-reviews.json'
         reviews = read_json(review_path) if review_path.exists() else {}
         assembly_sources = {i['sha256']: i for i in items if i['kind'] == 'assembly' and i.get('sha256')}
-        for path, manifest in self._post_manifests():
+        from .publication_history import PublicationHistory
+        manifests = [manifest for _, manifest in self._post_manifests()]
+        lineages = {job['outputSha256']: job['sourceSha256'] for manifest in manifests
+                    for job in manifest.get('jobs', []) if job.get('outputSha256') and job.get('sourceSha256')}
+        publications = PublicationHistory(self._service.projects.root, lineages=lineages)
+        for manifest in manifests:
             for job in manifest.get('jobs', []):
                 parent = source_links.get(str(Path(job['source']).resolve()).casefold()) or assembly_sources.get(job.get('sourceSha256'), {})
                 linkage = job.get('workbench', {})
@@ -330,6 +343,8 @@ class WorkbenchMixin(BatchWorkbenchMixin):
                               int((re.search(r'第(\d+)组', Path(job['source']).name) or [None, '0'])[1]),
                               'group_ids': parent.get('group_ids') or linkage.get('group_ids'),
                               'source_id': parent.get('id'), 'source_path': job['source'],
+                              'source_sha256': job.get('sourceSha256'), 'output_sha256': job.get('outputSha256'),
+                              'publication': publications.find(job.get('outputSha256'), job.get('sourceSha256')),
                               'batch_id': manifest['id'], 'job_id': job['id'], 'status': job.get('status'),
                               'path': job.get('output'), 'available': bool(job.get('output') and Path(job['output']).is_file()),
                               'duration': job.get('media', {}).get('duration'),
@@ -370,12 +385,23 @@ class WorkbenchMixin(BatchWorkbenchMixin):
                 continue
             seen.add(identity)
             status, phase = item['status'], item.get('queue_phase')
-            if status == 'downloaded' and item['available']:
-                category, label = 'completed', '已完成'
+            tracking = item.get('tracking', {})
+            if status in ('failed', 'canceled', 'cancelled', 'completed_no_resource'):
+                category, label = 'failed', '已取消' if status in ('canceled', 'cancelled') else '失败'
+            elif phase == 'retry_wait':
+                category, label = 'running', '正在自动重试下载' if tracking.get('stage') == 'download' else '连接中断 · 自动重试'
+            elif phase in ('downloading', 'assembling'):
+                category, label = 'running', '正在下载' if phase == 'downloading' else '正在合并原片'
+            elif phase == 'tracking' and tracking.get('stale'):
+                category, label = 'running', '正在同步 · 上次状态已过期'
+            elif phase == 'attention':
+                category, label = 'attention', ('自动重试多次未成功' if tracking.get('retry_exhausted') else
+                                              '已生成 · 下载待处理' if status == 'completed' else
+                                              '状态同步中断 · 需处理' if tracking.get('stale') else '需处理')
+            elif status == 'downloaded' and item['available']:
+                category, label = 'completed', ('完整原片已就绪' if item.get('complete_ready') else '分段已下载 · 等待其余分段') if item.get('job_id') else '已完成'
             elif status == 'completed':
                 category, label = 'attention', '已生成 · 下载待处理' if item.get('error') else '已生成 · 等待下载'
-            elif status in ('failed', 'canceled', 'cancelled', 'completed_no_resource'):
-                category, label = 'failed', '已取消' if status in ('canceled', 'cancelled') else '失败'
             elif phase == 'attention' or status in ('submission_unknown', 'requires_manual_review', 'downloaded', 'node_create_unknown'):
                 category, label = 'attention', '本地视频缺失' if status == 'downloaded' else '待核查'
             elif status in ('draft', 'preparing', 'needs_review', 'awaiting_approval'):
@@ -386,6 +412,61 @@ class WorkbenchMixin(BatchWorkbenchMixin):
                           'category': category, 'status_label': label,
                           'submitted': bool(item.get('submit_id') or item.get('task_id'))})
         return {'items': items}
+
+    def workbench_legacy_resume(self, item_id):
+        """Explicitly query/download an existing legacy round, never submit it."""
+        from types import SimpleNamespace
+        from .compshare import GenerationWorkflow, channel_for
+        from .generation import CanvasError
+        from .project_run import workflow_lock
+        item = self._library_item(item_id)
+        if item['kind'] != 'generation' or item.get('job_id'):
+            raise ValueError('请选择旧版已提交任务')
+        pid = item['project_id']
+        with workflow_lock(Path(self._service.projects.get(pid)['directory'])):
+            project = self._service.projects.get(pid)
+            rounds = list(enumerate(project.get('generation_history', []))) + [(-1, project.get('generation', {}))]
+            match = next(((index, cfg) for index, cfg in rounds for gid, task in cfg.get('tasks', {}).items()
+                          if task.get('submit_id') and
+                          media_identity('generation', pid, gid, task, f'generation:{pid}:{index}:{gid}') == item_id), None)
+            if match is None:
+                raise ValueError('原提交记录已变化，请刷新任务列表')
+            index, cfg = match
+            tasks = list(cfg.get('tasks', {}).values())
+            if any(t.get('status', '').startswith('audio_') for t in tasks):
+                raise ValueError('此旧轮次仍有配音阶段任务，继续可能产生新的视频提交；请先核对原任务')
+            if channel_for(cfg.get('model')) == 'compshare' and any(t.get('submit_id') and t.get('status') not in ('downloaded', 'failed', 'canceled', 'cancelled') and not t.get('task_id') for t in tasks):
+                raise ValueError('原 H3 提交尚无平台任务 ID，请先核对平台记录；不会重新生成')
+            # The workflow sees only the selected round. Saves retain the active
+            # round, other history, and original submission snapshots untouched.
+            view = copy.deepcopy(project)
+            view['generation'] = copy.deepcopy(cfg)
+            def get(identifier):
+                if identifier != pid:
+                    raise ValueError('任务项目不匹配')
+                return copy.deepcopy(view)
+            def save(updated):
+                nonlocal view
+                latest = self._service.projects.get(pid)
+                if index == -1:
+                    latest['generation'] = copy.deepcopy(updated['generation'])
+                else:
+                    latest['generation_history'][index] = copy.deepcopy(updated['generation'])
+                self._service.projects.save(latest)
+                view = copy.deepcopy(updated)
+            flow = GenerationWorkflow(SimpleNamespace(config=self._service.config,
+                                                      projects=SimpleNamespace(get=get, save=save)))
+            query_error = None
+            try:
+                flow.refresh(pid)
+            except CanvasError as exc:
+                query_error = exc
+            result = flow.download(pid)
+            if query_error:
+                raise query_error
+            states = [t.get('status') for t in result['generation'].get('tasks', {}).values() if t.get('submit_id')]
+            running = any(state not in ('downloaded', 'failed', 'canceled', 'cancelled', 'completed_no_resource') for state in states)
+            return {'message': '原任务仍在生成，稍后可继续查询此旧轮次' if running else '此旧轮次查询结束，可用视频已保存，失败项请查看任务记录'}
 
     def workbench_group_image(self, project_id, group_id, side):
         """Global browser reads explicit project assets without switching the active project."""
@@ -624,18 +705,10 @@ class WorkbenchMixin(BatchWorkbenchMixin):
                 raise ValueError('本组已有生成草稿或任务，请先新建轮次再清理，旧视频保留')
             if not self._agent.connection_state().get('connected'):
                 raise ValueError('Agent 已断开，请在右侧重新连接；也可使用手动框选修复')
-            state = self._agent._session(project_id)
-            model = next((m for m in self._agent.models if m['model'] == state.get('model')), None)
-            model = model or next((m for m in self._agent.models if m.get('isDefault')), None) or next(iter(self._agent.models), None)
-            if not model:
-                raise ValueError('Agent 模型目录尚未就绪，请稍后重试')
-            effort = state.get('effort') or model['defaultReasoningEffort']
-            if effort not in [e['reasoningEffort'] for e in model['supportedReasoningEfforts']]:
-                effort = model['defaultReasoningEffort']
             return self._agent.send(project_id,
                 '请只处理本次指定图片组的A、B两图：逐图查看，去除水印和叠加字幕，使用本地repair_region修复，再逐图复看并record_reference_review记录。'
                 '没有水印字幕的图直接跳过并记录。场景内招牌不清除。不要生成视频，不修改台词或音色。',
-                model['model'], effort, group_ids)
+                AGENT_MODEL, AGENT_EFFORT, group_ids)
 
     def workbench_generation_preview(self, project_id, group_ids, config):
         with self.lock:

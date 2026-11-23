@@ -5,6 +5,8 @@ from pathlib import Path
 
 from jsonschema import ValidationError, validate
 
+from .agent_model import AGENT_EFFORT, AGENT_MODEL
+
 
 class ProviderError(RuntimeError):
     def __init__(self, message, code='provider_error'):
@@ -134,7 +136,8 @@ def request_images(codex: str, images: list[Path], output: Path, instruction: st
     final = output / 'analysis.json'
     instruction = '只观察所附图片，不调用工具、不读其他文件。附件从0编号。只输出满足schema的JSON。' + instruction
     args = [codex, 'exec', '--ignore-user-config', '--skip-git-repo-check', '--ephemeral',
-            '--model', 'gpt-6.1-sol',
+            '--model', AGENT_MODEL,
+            '-c', f'model_reasoning_effort="{AGENT_EFFORT}"',
             '-c', 'model_provider="workbench_http"',
             '-c', 'model_providers.workbench_http.name="Workbench HTTP"',
             '-c', 'model_providers.workbench_http.wire_api="responses"',

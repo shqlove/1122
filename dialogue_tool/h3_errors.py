@@ -95,8 +95,12 @@ def network_reason(exc):
         return 'connection_interrupted', '与优云智算的连接中途断开，未收到完整回复', True
     if isinstance(reason, OSError) and reason.errno == errno.ENOSPC:
         return 'disk_full', '本地磁盘空间不足，无法保存视频，请清理空间后重试下载', False
+    if isinstance(reason, OSError) and (reason.errno == errno.ENAMETOOLONG or getattr(reason, 'winerror', None) == 206):
+        return 'path_too_long', '本地视频保存路径过长，无法写入文件，请缩短工作台数据目录路径', False
     if isinstance(reason, PermissionError):
         return 'file_permission', '工作台无法写入视频保存目录，请检查目录权限或文件占用', False
+    if isinstance(reason, (FileNotFoundError, NotADirectoryError, IsADirectoryError)):
+        return 'file_path_invalid', '本地视频保存目录不可用，请检查目录是否存在及路径是否有效', False
     if isinstance(reason, HTTPException):
         return 'incomplete_response', '优云智算的回复未完整传回，请稍后重试查询', True
     return 'connection_failed', '无法连接优云智算，请检查网络和系统代理后重试', True

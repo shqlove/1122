@@ -12,6 +12,17 @@ from dialogue_tool.generation import CanvasError, CanvasWorkflow
 from dialogue_tool.service import Service
 
 
+@pytest.mark.parametrize('action', [['node', 'run'], ['node', 'confirm'], ['node', 'create', 'video']])
+def test_write_timeout_never_gets_automatic_retry_permission(monkeypatch, action):
+    import subprocess
+    def timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired('test-cli', 120)
+    monkeypatch.setattr(generation.subprocess, 'run', timeout)
+    with pytest.raises(CanvasError) as caught:
+        generation.invoke('test-cli', action)
+    assert caught.value.retryable is False
+
+
 def test_model_auth_failure_refreshes_once_then_rechecks(tmp_path, monkeypatch):
     calls = []
     def fake(cli, args, timeout=120):
